@@ -1,0 +1,15 @@
+# ── Credentials — NEVER commit these ────────────────────────
+config/.env
+config/dhan_token.txt
+
+# ── Generated files ──────────────────────────────────────────
+models/xgb_model.pkl
+models/scaler.pkl
+models/xgb_model_backup.pkl
+models/scaler_backup.pkl
+logs/
+__pycache__/
+*.pyc
+venv/
+.venv/
+data/historical/
