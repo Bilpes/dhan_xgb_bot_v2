@@ -19,10 +19,10 @@ TELEGRAM_CHAT_ID_1= os.getenv("TELEGRAM_CHAT_ID_1", "")
 TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 
 # ── Capital & risk ──────────────────────────────────────────
-CAPITAL              = 50_000      # update as you scale
+CAPITAL              = 60_000      # update as you scale
 MAX_RISK_PCT         = 0.02        # 2% risk per trade (Rs.1,000 on Rs.50k)
-MAX_CAPITAL_PER_TRADE= 0.90        # never put more than 90% in one trade
-MAX_OPEN_TRADES      = 5           # 1 now, 2 at month 3, 3 at month 5
+MAX_CAPITAL_PER_TRADE= 0.45        # never put more than 90% in one trade
+MAX_OPEN_TRADES      = 2           # 1 now, 2 at month 3, 3 at month 5
 DAILY_LOSS_LIMIT     = 0.06        # circuit breaker: halt if -6% on the day
 
 # ── Trade mode ──────────────────────────────────────────────
@@ -31,6 +31,7 @@ AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
 AUTO_EXIT_TIME       = "14:45"     # time to check for same-day exit
 MAX_OPEN_TRADES      = 4
+NO_NEW_TRADE_BEFORE = "09:30"   # wait 15 min for market to settle
 # ── XGBoost signal thresholds ───────────────────────────────
 BUY_THRESHOLD        = 0.65
 SELL_THRESHOLD       = 0.38

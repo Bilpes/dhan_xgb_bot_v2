@@ -28,14 +28,15 @@ from bot.telegram_alert import (
 from config.config import (
     WATCHLIST, SECTOR_MAP, TRADE_MODE, MAX_OPEN_TRADES,
     MARKET_OPEN, MARKET_CLOSE, INTRADAY_CUTOFF,
-    NO_NEW_TRADE_AFTER, TRADE_LOG, LOG_FILE, CAPITAL,
+    NO_NEW_TRADE_AFTER,NO_NEW_TRADE_BEFORE, TRADE_LOG, LOG_FILE, CAPITAL,
 )
 
-# Max stocks per sector simultaneously (configurable via .env)
-MAX_PER_SECTOR = int(os.getenv("MAX_PER_SECTOR", "2"))
-
-# Stop new entries if daily loss exceeds this % (before circuit breaker)
+MAX_PER_SECTOR       = int(os.getenv("MAX_PER_SECTOR", "2"))
 NEW_TRADE_LOSS_PAUSE = float(os.getenv("NEW_TRADE_LOSS_PAUSE", "-0.03"))
+
+# ── Timing constants ──────────────────────────────────────────
+MONITOR_INTERVAL  = 60    # check open positions every 60 seconds
+SCAN_INTERVAL     = 300   # scan for new entries every 5 minutes (one candle)
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -118,10 +119,10 @@ class LiveBot:
         self.trades        = {}
         self.closed_trades = []
         self.paper_pnl     = 0.0
-
-        # Daily SL blacklist — stocks that hit SL today
-        # Reset at start of each trading day
         self.sl_blacklist  = set()
+
+        # Track when we last ran a full candle scan
+        self._last_scan_time = 0.0
 
     # =========================================================
     # TEST MODE
@@ -160,8 +161,8 @@ class LiveBot:
                     f"Rs.{price:.1f}  conf={prob:.1%}  "
                     f"SL=Rs.{sl:.1f}  qty={qty}  [{sector}]"
                 )
-                log.info("  %s: %s prob=%.3f price=%.2f SL=%.2f qty=%d [%s]",
-                         symbol, signal, prob, price, sl, qty, sector)
+                log.info("  %s: %s prob=%.3f price=%.2f [%s]",
+                         symbol, signal, prob, price, sector)
             except Exception as e:
                 results.append(f"  {symbol:<14} error: {e}")
                 log.error("  %s error: %s", symbol, e)
@@ -176,84 +177,94 @@ class LiveBot:
                 + "\n".join(chunk)
             )
             if idx == len(chunks) - 1:
-                msg += "\n\nBot OK. Set BOT_MODE=paper to start paper trading."
+                msg += "\n\nBot OK. Set BOT_MODE=paper to start."
             _send(msg)
 
         log.info("Test complete.")
 
     # =========================================================
-    # SCAN AND ENTER
+    # SCAN AND ENTER — ranked by confidence (best signal first)
     # =========================================================
     def scan_and_enter(self):
+
+        # Wait for market settle time
+        if now_time() < time_from_str(NO_NEW_TRADE_BEFORE):
+            log.info("Waiting for market to settle until %s ...",
+                     NO_NEW_TRADE_BEFORE)
+            return
+                    
         if no_new_trades():
-            log.info("Past %s -- no new entries.", NO_NEW_TRADE_AFTER)
             return
-
         if len(self.trades) >= MAX_OPEN_TRADES:
-            log.info("Max open trades (%d) reached.", MAX_OPEN_TRADES)
             return
 
-        # FIX 1: Stop new trades if daily loss too high
-        # Even before circuit breaker, pause new entries at -3%
-        daily_loss_pct = self.risk.daily_pnl / CAPITAL
-        if daily_loss_pct <= NEW_TRADE_LOSS_PAUSE:
-            log.warning(
-                "Daily loss %.1f%% -- pausing new entries to protect capital.",
-                daily_loss_pct * 100
-            )
+        # Loss pause — stop new entries at -3% daily loss
+        if self.risk.daily_pnl / CAPITAL <= NEW_TRADE_LOSS_PAUSE:
+            log.warning("Daily loss %.1f%% -- pausing new entries.",
+                        self.risk.daily_pnl / CAPITAL * 100)
             return
+
+        log.info("-- Full scan: ranking all eligible stocks --")
+
+        candidates = []
 
         for symbol, sec_id in WATCHLIST.items():
-            # Skip if already holding this stock
             if symbol in self.trades:
                 continue
-
-            # FIX 2: Skip if stock hit SL today — blacklisted until tomorrow
             if symbol in self.sl_blacklist:
-                log.info("%s: Skipping -- SL was hit today (blacklisted).", symbol)
+                log.info("%s: Skipping -- SL blacklisted today.", symbol)
                 continue
 
-            # Sector limit -- max MAX_PER_SECTOR per sector
             stock_sector = SECTOR_MAP.get(symbol, "unknown")
             sector_count = sum(
                 1 for sym in self.trades
                 if SECTOR_MAP.get(sym, "unknown") == stock_sector
             )
             if sector_count >= MAX_PER_SECTOR:
-                log.info("%s: Skipping -- already have %d/%d %s stocks.",
-                         symbol, sector_count, MAX_PER_SECTOR, stock_sector)
                 continue
 
             df = self.broker.get_candles(sec_id, symbol, days_back=10)
             if df.empty:
-                log.warning("%s: No candle data.", symbol)
                 continue
 
             result = self.engine.score(df)
-            signal = result["signal"]
 
-            if signal == "HOLD":
-                log.info("%s: HOLD (prob=%.3f)", symbol, result["prob_up"])
-                continue
+            if result["signal"] == "BUY":
+                candidates.append((symbol, sec_id, result))
+                log.info("  Candidate: %s prob=%.3f [%s]",
+                         symbol, result["prob_up"], stock_sector)
 
-            entry  = result["entry"]
-            atr    = result["atr"]
-            sl     = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
-            target = self.risk.calc_target(entry, sl)
-            qty    = self.risk.position_size(entry, sl)
+        if not candidates:
+            log.info("No BUY signals this scan.")
+            return
 
-            if qty <= 0:
-                log.warning("%s: qty=0 -- skipping.", symbol)
-                continue
+        # Sort by confidence — highest prob_up first
+        candidates.sort(key=lambda x: x[2]["prob_up"], reverse=True)
 
-            log.info("SIGNAL %s | %s [%s] | entry=%.2f | SL=%.2f | target=%.0f | qty=%d | prob=%.3f",
-                     signal, symbol, stock_sector, entry, sl, target, qty, result["prob_up"])
+        log.info("Top signal: %s prob=%.3f (from %d candidates)",
+                 candidates[0][0], candidates[0][2]["prob_up"], len(candidates))
 
-            if BOT_MODE == "live":
-                self._enter_live(symbol, sec_id, qty, entry, sl, target, result)
-            else:
-                self._enter_paper(symbol, sec_id, qty, entry, sl, target, result)
-            break
+        # Pick best signal
+        best_symbol, best_sec_id, best_result = candidates[0]
+        stock_sector = SECTOR_MAP.get(best_symbol, "?")
+
+        entry  = best_result["entry"]
+        atr    = best_result["atr"]
+        sl     = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
+        target = self.risk.calc_target(entry, sl)
+        qty    = self.risk.position_size(entry, sl)
+
+        if qty <= 0:
+            log.warning("%s: qty=0 -- skipping.", best_symbol)
+            return
+
+        log.info("SIGNAL BUY | %s [%s] | entry=%.2f | SL=%.2f | target=%.0f | qty=%d | prob=%.3f",
+                 best_symbol, stock_sector, entry, sl, target, qty, best_result["prob_up"])
+
+        if BOT_MODE == "live":
+            self._enter_live(best_symbol, best_sec_id, qty, entry, sl, target, best_result)
+        else:
+            self._enter_paper(best_symbol, best_sec_id, qty, entry, sl, target, best_result)
 
     def _enter_live(self, symbol, sec_id, qty, entry, sl, target, result):
         resp = self.broker.place_bracket_order(
@@ -293,17 +304,19 @@ class LiveBot:
             "prob_up": result["prob_up"], "pnl": "",
         })
         log.info("[PAPER] Simulated BUY %s [%s] | qty=%d @ %.2f | SL=%.2f | target=%.0f",
-                 symbol, SECTOR_MAP.get(symbol,"?"), qty, entry, sl, target)
+                 symbol, SECTOR_MAP.get(symbol, "?"), qty, entry, sl, target)
         alert_entry(symbol, entry, sl, target, qty,
                     result["prob_up"], TRADE_MODE, entry * qty)
 
     # =========================================================
-    # MONITOR POSITIONS -- ONE batch LTP call
+    # MONITOR POSITIONS — runs every 60 seconds
+    # Catches fast SL hits and trailing stops promptly
     # =========================================================
     def monitor_positions(self):
         if not self.trades:
             return
 
+        # ONE batch LTP call for all open positions
         id_symbol_map = {
             str(trade.security_id): symbol
             for symbol, trade in self.trades.items()
@@ -335,9 +348,8 @@ class LiveBot:
             if ltp <= trade.stop_loss:
                 log.warning("%s: SL hit at %.2f", symbol, ltp)
                 self._exit_trade(trade, ltp, "SL_HIT")
-                # Add to daily blacklist -- won't re-buy this stock today
                 self.sl_blacklist.add(symbol)
-                log.info("%s: Added to daily SL blacklist.", symbol)
+                log.info("%s: Added to SL blacklist for today.", symbol)
                 continue
 
             # CNC safety -- auto exit at 2:45 PM if in loss
@@ -348,19 +360,25 @@ class LiveBot:
                     self._exit_trade(trade, ltp, "AUTO_EXIT_WEAK_MARKET")
                     continue
 
-            # Signal flip
-            df = self.broker.get_candles(trade.security_id, symbol, days_back=5)
-            if not df.empty and self.engine.should_exit(df, trade.side):
-                log.info("%s: Signal flip -> exit at %.2f | P&L=%.0f",
-                         symbol, ltp, pnl)
-                self._exit_trade(trade, ltp, "SIGNAL_FLIP")
-                continue
+            # Signal flip — only check on candle boundaries (every 5 min)
+            # Skip during fast 60s monitor cycles to avoid noise
+            if self._is_candle_boundary():
+                df = self.broker.get_candles(trade.security_id, symbol, days_back=5)
+                if not df.empty and self.engine.should_exit(df, trade.side):
+                    log.info("%s: Signal flip -> exit at %.2f | P&L=%.0f",
+                             symbol, ltp, pnl)
+                    self._exit_trade(trade, ltp, "SIGNAL_FLIP")
+                    continue
 
             log.info("%s [%s]: Holding | LTP=%.2f | SL=%.2f | P&L=%.0f",
-                     symbol, SECTOR_MAP.get(symbol,"?"), ltp, trade.stop_loss, pnl)
+                     symbol, SECTOR_MAP.get(symbol, "?"), ltp, trade.stop_loss, pnl)
+
+    def _is_candle_boundary(self) -> bool:
+        """True when current time is on or near a 5-minute candle boundary."""
+        return datetime.now().minute % 5 == 0
 
     # =========================================================
-    # FORCE EXIT -- at INTRADAY_CUTOFF
+    # FORCE EXIT
     # =========================================================
     def force_exit_all(self, reason="CNC_EOD_CUTOFF"):
         if not self.trades:
@@ -377,13 +395,11 @@ class LiveBot:
 
         for symbol, trade in list(self.trades.items()):
             ltp = prices.get(str(trade.security_id), 0.0)
-
             if ltp <= 0:
                 ltp = trade.running_high if trade.running_high > trade.entry \
                       else trade.entry
                 log.warning("%s: LTP unavailable -- fallback price %.2f",
                             symbol, ltp)
-
             log.warning("%s: Force exit at %.2f | reason=%s", symbol, ltp, reason)
             self._exit_trade(trade, ltp, reason=reason)
 
@@ -433,12 +449,14 @@ class LiveBot:
         log.info("%s", MODE_LABEL[BOT_MODE])
         log.info("Capital: Rs.%s | Trade type: %s | Max/sector: %d",
                  f"{CAPITAL:,}", TRADE_MODE.upper(), MAX_PER_SECTOR)
-        log.info("New trade pause at: %.0f%% daily loss", NEW_TRADE_LOSS_PAUSE * 100)
+        log.info("Monitor: every %ds | Scan: every %ds",
+                 MONITOR_INTERVAL, SCAN_INTERVAL)
         log.info("Watching %d stocks", len(WATCHLIST))
         log.info("=" * 55)
 
         self.risk.reset_day()
-        self.sl_blacklist.clear()   # reset blacklist for new day
+        self.sl_blacklist.clear()
+        self._last_scan_time = 0.0
 
         alert_bot_started(
             capital    = CAPITAL,
@@ -449,10 +467,9 @@ class LiveBot:
         if BOT_MODE == "paper":
             _send(
                 "PAPER TRADE MODE\n"
-                "Full bot loop running.\n"
-                "Orders are simulated -- no real money.\n\n"
+                "Monitor: every 60s | Scan: every 5 min\n"
+                "Best confidence signal picked each candle.\n"
                 f"Max {MAX_PER_SECTOR} stocks per sector.\n"
-                f"New trades pause at {abs(NEW_TRADE_LOSS_PAUSE*100):.0f}% daily loss.\n"
                 "Set BOT_MODE=live when ready."
             )
 
@@ -460,6 +477,7 @@ class LiveBot:
 
         while True:
 
+            # Outside market hours
             if not is_market_open():
                 if not daily_summary_sent and now_time() >= time_from_str("15:30"):
                     alert_daily_summary(
@@ -472,12 +490,13 @@ class LiveBot:
                             f"Paper trade day complete\n"
                             f"Simulated P&L: Rs.{self.paper_pnl:+,.0f}\n"
                             f"Trades: {len(self.closed_trades)}\n"
-                            f"SL blacklist today: {', '.join(self.sl_blacklist) or 'none'}"
+                            f"SL blacklist: {', '.join(self.sl_blacklist) or 'none'}"
                         )
                     daily_summary_sent = True
                     self.closed_trades = []
                     self.paper_pnl     = 0.0
-                    self.sl_blacklist.clear()   # reset for next day
+                    self.sl_blacklist.clear()
+                    self._last_scan_time = 0.0
 
                 log.info("Market closed. Sleeping 60s...")
                 time.sleep(60)
@@ -485,6 +504,7 @@ class LiveBot:
 
             daily_summary_sent = False
 
+            # Circuit breaker
             if self.risk.is_halted():
                 alert_circuit_breaker(
                     daily_loss = self.risk.daily_pnl,
@@ -494,24 +514,29 @@ class LiveBot:
                 time.sleep(300)
                 continue
 
+            # EOD cutoff
             if is_cutoff_passed():
                 self.force_exit_all(reason="CNC_EOD_CUTOFF")
                 log.info("Past cutoff. All positions closed.")
                 time.sleep(60)
                 continue
 
-            log.info("-- Candle cycle [%s] %s | blacklist: %s --",
-                     BOT_MODE.upper(),
-                     datetime.now().strftime("%H:%M"),
-                     list(self.sl_blacklist) or "none")
+            now_ts = time.time()
 
+            # ── Monitor positions every 60 seconds ───────────
+            # Catches SL hits and trailing stops quickly
             self.monitor_positions()
-            self.scan_and_enter()
 
-            if now_time() >= time_from_str("15:20"):
-                time.sleep(60)
-            else:
-                time.sleep(300)
+            # ── Scan for new entries every 5 minutes ─────────
+            # Only on candle boundaries — avoids noisy mid-candle signals
+            if now_ts - self._last_scan_time >= SCAN_INTERVAL:
+                log.info("== Candle scan [%s] %s ==",
+                         BOT_MODE.upper(), datetime.now().strftime("%H:%M"))
+                self.scan_and_enter()
+                self._last_scan_time = now_ts
+
+            # Sleep 60 seconds then monitor again
+            time.sleep(MONITOR_INTERVAL)
 
 
 # ── Entry point ───────────────────────────────────────────────
