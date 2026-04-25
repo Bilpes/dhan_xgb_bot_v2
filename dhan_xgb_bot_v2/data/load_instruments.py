@@ -73,7 +73,6 @@ NIFTY50_SYMBOLS = {
     "TATACONSUM":  "fmcg",
     # Auto
     "MARUTI":      "auto",
-    "TATAMOTORS":  "auto",
     "M&M":         "auto",
     "BAJAJ-AUTO":  "auto",
     "EICHERMOT":   "auto",
@@ -105,6 +104,27 @@ NIFTY50_SYMBOLS = {
     "TATASTEEL":   "metals",
     "HINDALCO":    "metals",
     "VEDL":        "metals",
+    
+    # Add these to NIFTY50_SYMBOLS in data/load_instruments.py
+    "ETERNAL":      "consumer",
+    "PAYTM":       "fintech",
+    "NYKAA":       "consumer",
+    "DMART":       "retail",
+    "PIDILITIND":  "chemicals",
+    "SIEMENS":     "infra",
+    "HAVELLS":     "infra",
+    "VOLTAS":      "consumer",
+    "MUTHOOTFIN":  "finance",
+    "CHOLAFIN":    "finance",
+    "PERSISTENT":  "it",
+    "COFORGE":     "it",
+    "ICICIGI":     "insurance",
+    "HDFCLIFE":    "insurance",
+    "SBILIFE":     "insurance",
+    "TORNTPHARM":  "pharma",
+    "AUROPHARMA":  "pharma",
+    "APOLLOHOSP":  "pharma",
+    "TRENT":       "retail",
 }
 
 # ── Alternate spellings Dhan sometimes uses ─────────────────
@@ -117,6 +137,11 @@ SYMBOL_ALTERNATES = {
     "SHRIRAMFIN": ["SHRIRAMFIN", "SHRIRAM FIN", "SHRIRAMCIT"],
     "ADANIENT":   ["ADANIENT", "ADANI ENT"],
     "HEROMOTOCO": ["HEROMOTOCO", "HERO MOTO"],
+    
+    # New Code
+    "TATAMOTORS": ["TATAMOTORS", "TATA MOTORS", "TATAMTRDVR"],
+    "ETERNAL":    ["ETERNAL", "ZOMATO"],
+    "LTIM":       ["LTIM", "LTIMINDTREE", "LTI MINDTREE", "LTIM#"],
 }
 
 

@@ -22,7 +22,6 @@ TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 CAPITAL              = 60_000      # update as you scale
 MAX_RISK_PCT         = 0.02        # 2% risk per trade (Rs.1,000 on Rs.50k)
 MAX_CAPITAL_PER_TRADE= 0.45        # never put more than 90% in one trade
-MAX_OPEN_TRADES      = 2           # 1 now, 2 at month 3, 3 at month 5
 DAILY_LOSS_LIMIT     = 0.06        # circuit breaker: halt if -6% on the day
 
 # ── Trade mode ──────────────────────────────────────────────
@@ -30,7 +29,7 @@ TRADE_MODE           = "cnc"       # CNC delivery (shares go to demat)
 AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
 AUTO_EXIT_TIME       = "14:45"     # time to check for same-day exit
-MAX_OPEN_TRADES      = 4
+MAX_OPEN_TRADES      = 2          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
 NO_NEW_TRADE_BEFORE = "09:30"   # wait 15 min for market to settle
 # ── XGBoost signal thresholds ───────────────────────────────
 BUY_THRESHOLD        = 0.65
@@ -38,13 +37,17 @@ SELL_THRESHOLD       = 0.38
 
 # ── Stop-loss settings ──────────────────────────────────────
 STOP_LOSS_PCT        = 0.025       # hard cap: SL never more than 2.5% away
-ATR_MULTIPLIER_CNC   = 2.0         # wider stop for overnight holds
+ATR_MULTIPLIER_CNC   = 2.5         # wider stop for overnight holds
 ATR_MULTIPLIER_INTRA = 1.5         # tighter stop for intraday
 
 # ── Trailing stop ───────────────────────────────────────────
-TRAIL_AFTER_PCT      = 0.015       # activate after +1.5% profit
-TRAIL_DISTANCE       = 0.01        # trail 1% below running high
+TRAIL_AFTER_PCT      = 0.010       # activate after +1.5% profit
+TRAIL_DISTANCE       = 0.007       # trail 1% below running high
 
+# ── position rotation ───────────────────────────────────────────
+ROTATION_ENABLED     = True    # allow switching to better opportunity
+ROTATION_MIN_PROFIT  = 0.005   # only rotate if current position up 0.5%+
+ROTATION_MIN_EDGE    = 0.05    # new signal must be 5% more confident
 # ── Nifty 50 watchlist ──────────────────────────────────────
 # Auto-loaded from config/watchlist.json
 # Generate this file by running:  python data/load_instruments.py
