@@ -1,5 +1,5 @@
 # ============================================================
-#  bot/signal_engine.py  —  Load model, score live candles
+# bot/signal_engine.py — Load model, score live candles
 # ============================================================
 
 import pickle
@@ -12,46 +12,59 @@ from config.config import MODEL_PATH, SCALER_PATH, BUY_THRESHOLD, SELL_THRESHOLD
 
 log = logging.getLogger("signal")
 
-# ── Exit thresholds ───────────────────────────────────────────
-# Exit long when confidence drops below this level.
-# Much more responsive than waiting for full SELL signal.
-#
-# EXIT_THRESHOLD = 0.50 means: exit when model is no longer
-# confident price will go UP (prob_up dropped below 50%).
-# This is the "momentum fading" exit — catches turning points
-# before the full SELL signal fires.
-#
-# 0.55 = conservative (only exit on clear reversal)
-# 0.50 = balanced (exit when model uncertain)  <- recommended
-# 0.45 = aggressive (hold longer, risk more)
-EXIT_LONG_THRESHOLD  = 0.50   # exit LONG when prob_up drops below this
-EXIT_SHORT_THRESHOLD = 0.50   # exit SHORT when prob_up rises above this
+EXIT_LONG_THRESHOLD  = 0.42
+EXIT_SHORT_THRESHOLD = 0.42
+WEAK_THRESHOLD       = 0.48
+WEAK_CANDLES_MAX     = 2
 
 
 class SignalEngine:
 
     def __init__(self):
-        with open(MODEL_PATH,  "rb") as f:
-            self.model  = pickle.load(f)
+        with open(MODEL_PATH, "rb") as f:
+            self.model = pickle.load(f)
         with open(SCALER_PATH, "rb") as f:
             self.scaler = pickle.load(f)
+        self._weak_candles: dict = {}
+        self._nifty_df = None 
+        # ── NEW: Nifty50 candles stored here, updated every cycle ──
+        # Starts as None — build_features() handles None gracefully
+        # (fills nifty features with 0.0 = neutral until first update)
+        self._nifty_df: pd.DataFrame = None
+
         log.info("XGBoost model loaded.")
+
+    # ── NEW: Call this from live_bot.py every 5-min scan cycle ────
+    def update_nifty(self, nifty_df: pd.DataFrame):
+        """
+        Store fresh Nifty50 candles so score() uses them automatically.
+        Call this BEFORE scoring any stocks in each scan cycle:
+
+            engine.update_nifty(nifty_candles)
+            for symbol, df in watchlist.items():
+                result = engine.score(df)
+        """
+        self._nifty_df = nifty_df
+        log.debug("Nifty candles updated: %d rows, last=%s",
+                  len(nifty_df), nifty_df.index[-1])
 
     def score(self, df: pd.DataFrame) -> dict:
         """
-        Input:  raw OHLCV DataFrame (last N candles)
+        Input: raw OHLCV DataFrame (last N candles)
         Output: {
-            "signal":  "BUY" | "SELL" | "HOLD",
-            "prob_up": float (0-1, model confidence for UP move),
-            "atr":     float (latest ATR for SL sizing),
-            "entry":   float (suggested entry = last close),
+            "signal": "BUY" | "SELL" | "HOLD",
+            "prob_up": float,
+            "atr":     float,
+            "entry":   float,
         }
         """
         if len(df) < 55:
             return {"signal": "HOLD", "prob_up": 0.5, "atr": 0, "entry": 0}
 
         try:
-            feat_df = build_features(df)
+            # ── CHANGED: pass self._nifty_df (None is safe) ───────
+            feat_df = build_features(df, nifty_df=self._nifty_df)
+
             if feat_df.empty:
                 return {"signal": "HOLD", "prob_up": 0.5, "atr": 0, "entry": 0}
 
@@ -72,94 +85,78 @@ class SignalEngine:
             log.debug("Signal: %s | prob_up=%.3f | entry=%.2f | ATR=%.2f",
                       signal, prob_up, entry, atr)
 
-            return {
-                "signal":  signal,
-                "prob_up": prob_up,
-                "atr":     atr,
-                "entry":   entry,
-            }
+            return {"signal": signal, "prob_up": prob_up,
+                    "atr": atr, "entry": entry}
 
         except Exception as e:
             log.error("Signal scoring error: %s", e)
             return {"signal": "HOLD", "prob_up": 0.5, "atr": 0, "entry": 0}
 
-    def should_exit(self, df: pd.DataFrame, position_side: str) -> bool:
+    def should_exit(self, df: pd.DataFrame, position_side: str,
+                    symbol: str = "__default__") -> bool:
         """
         Re-scores current candle and decides whether to exit.
-
-        FIX: Old logic only exited on full SELL signal (prob < 0.38).
-             That almost never fired because stocks hover in HOLD zone.
-
-        New logic — three exit conditions for LONG positions:
-          1. Full reversal: signal == SELL (prob_up < SELL_THRESHOLD)
-          2. Momentum fade: prob_up drops below EXIT_LONG_THRESHOLD (0.50)
-             This catches "losing confidence" before full reversal
-          3. Consecutive weakness: prob_up below 0.55 for 2 candles in a row
-             (tracked via self._weak_candles counter)
-
-        Result: signal flip fires much more often, cutting losers earlier
-                and locking in profits on winners before they reverse.
+        Nifty context is automatically included via self._nifty_df
+        since score() uses it internally — no change needed here.
         """
-        result  = self.score(df)
+        result  = self.score(df)   # ← nifty already included via score()
         prob_up = result["prob_up"]
         signal  = result["signal"]
 
         if position_side == "LONG":
 
-            # Condition 1 — Full reversal (original logic)
             if signal == "SELL":
-                log.info("Signal flip SELL | prob_up=%.3f | exiting LONG",
-                         prob_up)
-                self._weak_candles = 0
+                log.info("Signal flip SELL | prob_up=%.3f | exiting LONG [%s]",
+                         prob_up, symbol)
+                self._weak_candles[symbol] = 0
                 return True
 
-            # Condition 2 — Momentum fade: model no longer confident in up move
             if prob_up < EXIT_LONG_THRESHOLD:
-                log.info("Momentum fade | prob_up=%.3f < %.2f | exiting LONG",
-                         prob_up, EXIT_LONG_THRESHOLD)
-                self._weak_candles = 0
+                log.info("Momentum fade | prob_up=%.3f < %.2f | exiting LONG [%s]",
+                         prob_up, EXIT_LONG_THRESHOLD, symbol)
+                self._weak_candles[symbol] = 0
                 return True
 
-            # Condition 3 — Two consecutive weak candles (prob < 0.55)
-            # Catches slow deterioration rather than sudden drops
-            WEAK_THRESHOLD   = 0.55
-            WEAK_CANDLES_MAX = 2
             if prob_up < WEAK_THRESHOLD:
-                self._weak_candles = getattr(self, "_weak_candles", 0) + 1
-                log.info("Weak candle %d/%d | prob_up=%.3f",
-                         self._weak_candles, WEAK_CANDLES_MAX, prob_up)
-                if self._weak_candles >= WEAK_CANDLES_MAX:
-                    log.info("Consecutive weakness | exiting LONG")
-                    self._weak_candles = 0
+                self._weak_candles[symbol] = self._weak_candles.get(symbol, 0) + 1
+                log.info("Weak candle %d/%d | prob_up=%.3f [%s]",
+                         self._weak_candles[symbol], WEAK_CANDLES_MAX,
+                         prob_up, symbol)
+                if self._weak_candles[symbol] >= WEAK_CANDLES_MAX:
+                    log.info("Consecutive weakness | exiting LONG [%s]", symbol)
+                    self._weak_candles[symbol] = 0
                     return True
             else:
-                # Reset counter if candle is strong again
-                self._weak_candles = 0
+                self._weak_candles[symbol] = 0
 
         elif position_side == "SHORT":
 
-            # Mirror logic for SHORT positions
             if signal == "BUY":
-                log.info("Signal flip BUY | prob_up=%.3f | exiting SHORT",
-                         prob_up)
-                self._weak_candles = 0
+                log.info("Signal flip BUY | prob_up=%.3f | exiting SHORT [%s]",
+                         prob_up, symbol)
+                self._weak_candles[symbol] = 0
                 return True
 
             if prob_up > EXIT_SHORT_THRESHOLD:
-                log.info("Momentum fade up | prob_up=%.3f | exiting SHORT",
-                         prob_up)
+                log.info("Momentum fade up | prob_up=%.3f | exiting SHORT [%s]",
+                         prob_up, symbol)
+                self._weak_candles[symbol] = 0
                 return True
 
         return False
 
+    def reset_symbol(self, symbol: str):
+        """Call when a position is closed — clears that symbol's weak counter."""
+        self._weak_candles.pop(symbol, None)
+
     def score_batch(self, stocks: dict) -> dict:
         """
         Score multiple stocks at once.
-        More efficient than calling score() in a loop.
+        Nifty context is shared across all stocks via self._nifty_df —
+        call update_nifty() once before score_batch(), not inside it.
 
         Args:
-            stocks: {symbol: df}  e.g. {"HDFCBANK": df1, "TCS": df2}
-
+            stocks: {symbol: df}
         Returns:
             {symbol: score_dict}
         """

@@ -34,14 +34,18 @@ from config.config import (
 MAX_PER_SECTOR       = int(os.getenv("MAX_PER_SECTOR", "2"))
 NEW_TRADE_LOSS_PAUSE = float(os.getenv("NEW_TRADE_LOSS_PAUSE", "-0.03"))
 
-MONITOR_INTERVAL = 60    # check positions every 60 seconds
-SCAN_INTERVAL    = 300   # scan for new entries every 5 minutes
+# ── NEW: Dhan security_id for Nifty50 index ──────────────────
+# Exchange segment = IDX_I, instrument = INDEX
+NIFTY50_SECURITY_ID = os.getenv("NIFTY50_SECURITY_ID", "13")
+
+MONITOR_INTERVAL = 60
+SCAN_INTERVAL    = 300
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    level   = logging.INFO,
-    format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    handlers= [
+    level    = logging.INFO,
+    format   = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    handlers = [
         logging.FileHandler(LOG_FILE),
         logging.StreamHandler(),
     ],
@@ -58,7 +62,7 @@ MODE_LABEL = {
 # ── Trade state ───────────────────────────────────────────────
 class Trade:
     def __init__(self, symbol, security_id, side, qty,
-                 entry, stop_loss, target, order_id, mode):
+                 entry, stop_loss, target, order_id, mode,last_prob: float = 0.5):
         self.symbol       = symbol
         self.security_id  = security_id
         self.side         = side
@@ -70,6 +74,7 @@ class Trade:
         self.mode         = mode
         self.running_high = entry
         self.open_time    = datetime.now()
+        self.last_prob    = last_prob 
 
     def unrealised_pnl(self, ltp: float) -> float:
         if self.side == "LONG":
@@ -122,6 +127,30 @@ class LiveBot:
         self._last_scan_time = 0.0
 
     # =========================================================
+    # ── NEW: Fetch and push Nifty candles to engine ──────────
+    # Called once per 5-min scan cycle BEFORE scoring any stock.
+    # engine.update_nifty() stores them so every score() call
+    # automatically gets Nifty context without extra API calls.
+    # =========================================================
+    def _refresh_nifty(self):
+        """Fetch latest Nifty50 5-min candles and push to signal engine."""
+        try:
+            nifty_df = self.broker.get_candles(
+                security_id = NIFTY50_SECURITY_ID,
+                symbol      = "NIFTY50",
+                days_back   = 5,
+            )
+            if not nifty_df.empty:
+                self.engine.update_nifty(nifty_df)
+                log.debug("Nifty refreshed: %d candles, last=%s",
+                          len(nifty_df), nifty_df.index[-1])
+            else:
+                log.warning("Nifty fetch returned empty — using previous or neutral values.")
+        except Exception as e:
+            log.warning("Nifty refresh failed: %s — engine uses neutral values.", e)
+            # engine._nifty_df stays as previous value or None — both handled safely
+
+    # =========================================================
     # TEST MODE
     # =========================================================
     def run_test(self):
@@ -136,6 +165,9 @@ class LiveBot:
             f"No orders placed.\n"
             f"Capital: Rs.{CAPITAL:,} | Mode: {TRADE_MODE.upper()}"
         )
+
+        # ── NEW: Fetch Nifty once before test scan ────────────
+        self._refresh_nifty()
 
         results = []
         for symbol, sec_id in WATCHLIST.items():
@@ -180,15 +212,9 @@ class LiveBot:
         log.info("Test complete.")
 
     # =========================================================
-    # ROTATION — exit weak position to enter stronger signal
+    # ROTATION
     # =========================================================
     def _should_rotate(self, new_prob: float) -> tuple:
-        """
-        Returns (should_rotate: bool, symbol_to_exit: str|None)
-        Rotates only if:
-          1. New signal confidence > existing + ROTATION_MIN_EDGE (5%)
-          2. Existing position profit > ROTATION_MIN_PROFIT (0.5%)
-        """
         if not self.trades:
             return False, None
 
@@ -212,34 +238,25 @@ class LiveBot:
             profit_pct = (ltp - trade.entry) / trade.entry
             if profit_pct < rotation_min_profit:
                 log.info("%s: Rotation skip -- profit %.2f%% below min",
-                         symbol, profit_pct * 100)
+                        symbol, profit_pct * 100)
                 continue
 
-            df = self.broker.get_candles(trade.security_id, symbol, days_back=5)
-            if df.empty:
-                continue
-            existing_prob = self.engine.score(df)["prob_up"]
+            # ── READ from cache — zero API calls ──────────────────
+            existing_prob = trade.last_prob
 
             if new_prob >= existing_prob + rotation_min_edge:
                 if weakest_symbol is None or existing_prob < weakest_prob:
                     weakest_symbol = symbol
                     weakest_prob   = existing_prob
                     log.info("Rotation candidate: exit %s (%.3f) for new (%.3f)",
-                             symbol, existing_prob, new_prob)
+                            symbol, existing_prob, new_prob)
 
         return (weakest_symbol is not None), weakest_symbol
 
     # =========================================================
-    # SYNC WITH DHAN — live mode only
-    # Detects positions closed by Dhan bracket order (SL/target hit)
-    # and syncs bot memory accordingly
+    # SYNC WITH DHAN
     # =========================================================
     def sync_with_dhan(self):
-        """
-        Live mode only — syncs bot memory with Dhan actual positions.
-        Since we use simple LIMIT orders (not bracket), positions only
-        disappear from Dhan if manually sold or bot's market sell fired.
-        """
         if BOT_MODE != "live":
             return
         if not self.trades:
@@ -248,16 +265,11 @@ class LiveBot:
         try:
             dhan_positions = self.broker.get_positions()
 
-            # SAFETY GUARD: if API returns empty, could be a glitch
-            # Only act if we have multiple confirmation attempts
             if dhan_positions.empty:
                 log.warning("sync_with_dhan: Dhan returned no positions "
                             "-- could be API glitch, skipping auto-close")
-                # Do NOT auto-close here — bot's 60s monitor will catch
-                # real SL hits via LTP check. Only log the warning.
                 return
 
-            # Build set of symbols open on Dhan
             col = None
             for c in ["tradingSymbol", "trading_symbol", "symbol"]:
                 if c in dhan_positions.columns:
@@ -284,7 +296,7 @@ class LiveBot:
             log.error("sync_with_dhan failed: %s", e)
 
     # =========================================================
-    # SCAN AND ENTER — ranked by confidence, with rotation
+    # SCAN AND ENTER
     # =========================================================
     def scan_and_enter(self):
         if now_time() < time_from_str(NO_NEW_TRADE_BEFORE):
@@ -303,7 +315,6 @@ class LiveBot:
 
         log.info("-- Full scan: ranking all eligible stocks --")
 
-        # Step 1: Collect ALL BUY candidates
         candidates = []
         for symbol, sec_id in WATCHLIST.items():
             if symbol in self.trades:
@@ -327,14 +338,13 @@ class LiveBot:
             result = self.engine.score(df)
             if result["signal"] == "BUY":
                 candidates.append((symbol, sec_id, result))
-                entry = result["entry"]
-                atr   = result["atr"]
-                sl    = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
-                target= self.risk.calc_target(entry, sl)
+                entry  = result["entry"]
+                atr    = result["atr"]
+                sl     = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
+                target = self.risk.calc_target(entry, sl)
                 log.info("  Candidate: %s prob=%.3f | CP=%.2f | SL=%.2f | TP=%.0f [%s]",
-                          symbol, result["prob_up"], entry, sl, target, stock_sector)
-               
-        # Step 2: Pick best signal
+                         symbol, result["prob_up"], entry, sl, target, stock_sector)
+
         if not candidates:
             log.info("No BUY signals this scan.")
             return
@@ -346,21 +356,19 @@ class LiveBot:
         log.info("Top signal: %s prob=%.3f (from %d candidates)",
                  best_symbol, best_result["prob_up"], len(candidates))
 
-        # Step 3: Handle max trades via rotation
         if max_reached:
             should_rotate, exit_symbol = self._should_rotate(best_result["prob_up"])
             if should_rotate:
                 trade_to_exit = self.trades[exit_symbol]
-                id_map = {str(trade_to_exit.security_id): exit_symbol}
-                prices = self.broker.get_ltp_batch(id_map)
-                ltp = prices.get(str(trade_to_exit.security_id), trade_to_exit.entry)
+                id_map  = {str(trade_to_exit.security_id): exit_symbol}
+                prices  = self.broker.get_ltp_batch(id_map)
+                ltp     = prices.get(str(trade_to_exit.security_id), trade_to_exit.entry)
                 log.info("ROTATION: exiting %s -> entering %s", exit_symbol, best_symbol)
                 self._exit_trade(trade_to_exit, ltp, "ROTATION_BETTER_SIGNAL")
             else:
                 log.info("Max trades reached, no rotation opportunity.")
                 return
 
-        # Step 4: Calculate and place entry
         entry  = best_result["entry"]
         atr    = best_result["atr"]
         sl     = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
@@ -390,7 +398,7 @@ class LiveBot:
             self.trades[symbol] = Trade(
                 symbol=symbol, security_id=sec_id, side="LONG",
                 qty=qty, entry=entry, stop_loss=sl, target=target,
-                order_id=order_id, mode=TRADE_MODE,
+                order_id=order_id, mode=TRADE_MODE, last_prob=result["prob_up"], 
             )
             log_trade({
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -409,7 +417,7 @@ class LiveBot:
             symbol=symbol, security_id=sec_id, side="LONG",
             qty=qty, entry=entry, stop_loss=sl, target=target,
             order_id="PAPER-" + datetime.now().strftime("%H%M%S"),
-            mode=TRADE_MODE,
+            mode=TRADE_MODE, last_prob=result["prob_up"], 
         )
         log_trade({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -424,13 +432,12 @@ class LiveBot:
                     result["prob_up"], TRADE_MODE, entry * qty)
 
     # =========================================================
-    # MONITOR POSITIONS — runs every 60 seconds
+    # MONITOR POSITIONS
     # =========================================================
     def monitor_positions(self):
         if not self.trades:
             return
 
-        # ONE batch call for all open positions
         id_symbol_map = {
             str(trade.security_id): symbol
             for symbol, trade in self.trades.items()
@@ -439,7 +446,6 @@ class LiveBot:
 
         for symbol, trade in list(self.trades.items()):
             ltp = prices.get(str(trade.security_id), 0.0)
-
             if ltp <= 0:
                 log.warning("%s: LTP unavailable -- skipping.", symbol)
                 continue
@@ -449,18 +455,14 @@ class LiveBot:
 
             pnl = trade.unrealised_pnl(ltp)
 
-            # Trailing stop
             should_trail, new_sl = self.risk.should_trail(
                 trade.entry, ltp, trade.running_high)
             if should_trail and new_sl > trade.stop_loss:
                 trade.stop_loss = new_sl
                 log.info("%s: Trail SL -> %.2f | LTP=%.2f | P&L=%.0f",
-                         symbol, new_sl, ltp, pnl)
+                        symbol, new_sl, ltp, pnl)
                 alert_trail_update(symbol, new_sl, ltp, pnl)
 
-            # FIX: Candle LOW check — catches SL hits that recover before
-            # the 60s monitor cycle runs. Checks actual candle low price
-            # which is more reliable than LTP snapshot.
             if self._is_candle_boundary():
                 try:
                     df_check = self.broker.get_candles(
@@ -478,7 +480,6 @@ class LiveBot:
                 except Exception as e:
                     log.warning("%s: Candle low SL check failed: %s", symbol, e)
 
-            # LTP stop-loss breach (fast check every 60s)
             if ltp <= trade.stop_loss:
                 log.warning("%s: SL hit at %.2f", symbol, ltp)
                 self._exit_trade(trade, ltp, "SL_HIT")
@@ -486,7 +487,6 @@ class LiveBot:
                 log.info("%s: Added to SL blacklist for today.", symbol)
                 continue
 
-            # CNC safety -- auto exit at 2:45 PM if in loss
             if is_auto_exit_time():
                 auto_thr = float(os.getenv("AUTO_EXIT_THRESHOLD", "-0.01"))
                 if (ltp - trade.entry) / trade.entry <= auto_thr:
@@ -494,17 +494,22 @@ class LiveBot:
                     self._exit_trade(trade, ltp, "AUTO_EXIT_WEAK_MARKET")
                     continue
 
-            # Signal flip — only on candle boundary to avoid mid-candle noise
             if self._is_candle_boundary():
                 df = self.broker.get_candles(trade.security_id, symbol, days_back=5)
-                if not df.empty and self.engine.should_exit(df, trade.side):
-                    log.info("%s: Signal flip -> exit at %.2f | P&L=%.0f",
-                             symbol, ltp, pnl)
-                    self._exit_trade(trade, ltp, "SIGNAL_FLIP")
-                    continue
+                if not df.empty:
+                    # ── UPDATE cached prob here — candles already fetched ──
+                    scored = self.engine.score(df)
+                    trade.last_prob = scored["prob_up"]   # ← ADD: refresh cache
 
-            log.info("%s [%s]: Holding | LTP=%.2f | SL=%.2f | P&L=%.0f",
-                     symbol, SECTOR_MAP.get(symbol, "?"), ltp, trade.stop_loss, pnl)
+                    if self.engine.should_exit(df, trade.side, symbol=symbol):
+                        log.info("%s: Signal flip -> exit at %.2f | P&L=%.0f",
+                                symbol, ltp, pnl)
+                        self._exit_trade(trade, ltp, "SIGNAL_FLIP")
+                        continue
+
+            log.info("%s [%s]: Holding | LTP=%.2f | SL=%.2f | prob=%.3f | P&L=%.0f",
+                    symbol, SECTOR_MAP.get(symbol, "?"),
+                    ltp, trade.stop_loss, trade.last_prob, pnl)  # ← prob in log now too
 
     def _is_candle_boundary(self) -> bool:
         return datetime.now().minute % 5 == 0
@@ -548,13 +553,13 @@ class LiveBot:
                      trade.symbol, exit_price, pnl)
 
         self.risk.update_pnl(pnl)
-
+        self.engine.reset_symbol(trade.symbol)
         log_trade({
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mode": BOT_MODE.upper(),
-            "symbol": trade.symbol, "action": "EXIT", "side": trade.side,
-            "qty": trade.qty, "price": exit_price,
-            "sl": trade.stop_loss, "target": trade.target,
+            "time":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mode":    BOT_MODE.upper(),
+            "symbol":  trade.symbol, "action": "EXIT", "side": trade.side,
+            "qty":     trade.qty,    "price":  exit_price,
+            "sl":      trade.stop_loss, "target": trade.target,
             "prob_up": "", "pnl": round(pnl, 2),
         })
 
@@ -569,7 +574,8 @@ class LiveBot:
 
         self.closed_trades.append({
             "symbol": trade.symbol, "entry": trade.entry,
-            "exit": exit_price, "qty": trade.qty, "pnl": round(pnl, 2),
+            "exit":   exit_price,   "qty":   trade.qty,
+            "pnl":    round(pnl, 2),
         })
         del self.trades[trade.symbol]
 
@@ -623,9 +629,9 @@ class LiveBot:
                             f"Trades: {len(self.closed_trades)}\n"
                             f"SL blacklist: {', '.join(self.sl_blacklist) or 'none'}"
                         )
-                    daily_summary_sent = True
-                    self.closed_trades = []
-                    self.paper_pnl     = 0.0
+                    daily_summary_sent   = True
+                    self.closed_trades   = []
+                    self.paper_pnl       = 0.0
                     self.sl_blacklist.clear()
                     self._last_scan_time = 0.0
 
@@ -652,14 +658,19 @@ class LiveBot:
 
             now_ts = time.time()
 
-            # Monitor every 60s — catches SL and trailing fast
             self.monitor_positions()
 
-            # Every 5 min — sync with Dhan + scan for new entries
             if now_ts - self._last_scan_time >= SCAN_INTERVAL:
                 log.info("== Candle scan [%s] %s ==",
                          BOT_MODE.upper(), datetime.now().strftime("%H:%M"))
-                self.sync_with_dhan()      # live mode: detect bracket SL/target hits
+
+                # ── NEW: Refresh Nifty FIRST, before scoring any stock ──
+                # This single call updates engine._nifty_df so all
+                # score() calls in scan_and_enter() automatically get
+                # Nifty context — no extra API calls per stock.
+                self._refresh_nifty()
+
+                self.sync_with_dhan()
                 self.scan_and_enter()
                 self._last_scan_time = now_ts
 

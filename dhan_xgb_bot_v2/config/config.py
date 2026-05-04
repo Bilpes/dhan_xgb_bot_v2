@@ -21,7 +21,7 @@ TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 # ── Capital & risk ──────────────────────────────────────────
 CAPITAL              = 150_000      # update as you scale
 MAX_RISK_PCT         = 0.02        # 2% risk per trade (Rs.1,000 on Rs.50k)
-MAX_CAPITAL_PER_TRADE= 0.45        # never put more than 90% in one trade
+MAX_CAPITAL_PER_TRADE= 0.18        # never put more than 90% in one trade
 DAILY_LOSS_LIMIT     = 0.06        # circuit breaker: halt if -6% on the day
 
 # ── Trade mode ──────────────────────────────────────────────
@@ -53,6 +53,7 @@ ROTATION_MIN_EDGE    = 0.05    # new signal must be 5% more confident
 # Generate this file by running:  python data/load_instruments.py
 # That script downloads Security IDs live from Dhan's master CSV
 # Never hardcode IDs here — always use load_instruments.py
+NIFTY50_SECURITY_ID=13
 
 import json as _json
 

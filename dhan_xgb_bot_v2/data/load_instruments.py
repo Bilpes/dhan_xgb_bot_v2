@@ -84,10 +84,8 @@ NIFTY50_SYMBOLS = {
     "DIVISLAB":    "pharma",
     # Infra / Cement
     "LT":          "infra",
-    "ULTRACEMCO":  "infra",
     "ADANIPORTS":  "infra",
     "ADANIENT":    "infra",
-    "SHREECEM":    "infra",
     # Finance / NBFC
     "BAJFINANCE":  "finance",
     "BAJAJFINSV":  "finance",
