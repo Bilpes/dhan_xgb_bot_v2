@@ -21,6 +21,7 @@ from config.config import (
 
 log = logging.getLogger("dhan_api")
 BASE_URL = "https://api.dhan.co/v2"
+_DHAN_ORDER_URL = "https://api.dhan.co/v2/orders"
 
 
 class DhanBroker:
@@ -206,22 +207,31 @@ class DhanBroker:
     # =========================================================
     #  ORDER PLACEMENT
     # =========================================================
-
+    
     def place_bracket_order(self, symbol, security_id, quantity,
-                             entry_price, stop_loss, target,
-                             trade_type="cnc") -> dict:
+                         entry_price, stop_loss, target,
+                         trade_type="cnc") -> dict:
+        """
+        For CNC: places a simple LIMIT buy order.
+        SL is managed by the bot (market sell when LTP hits SL).
+        Bracket orders only work for intraday — not CNC delivery.
+        """
         product = dhanhq.INTRA if trade_type == "intraday" else dhanhq.CNC
         try:
             resp = self.dhan.place_order(
-                security_id=security_id, exchange_segment=dhanhq.NSE,
-                transaction_type=dhanhq.BUY, quantity=quantity,
-                order_type=dhanhq.LIMIT, product_type=product,
-                price=round(entry_price, 2), trigger_price=0,
-                bo_profit_value=round(target - entry_price, 2),
-                bo_stop_loss_value=round(entry_price - stop_loss, 2),
+                security_id      = security_id,
+                exchange_segment = dhanhq.NSE,
+                transaction_type = dhanhq.BUY,
+                quantity         = quantity,
+                order_type       = dhanhq.LIMIT,
+                product_type     = product,
+                price            = round(entry_price, 2),
+                trigger_price    = 0,
+                validity         = "DAY",
+                tag              = f"BOT-{symbol[:6]}",
             )
-            log.info("ORDER PLACED | %s | qty=%d | entry=%.2f | SL=%.2f | target=%.2f",
-                     symbol, quantity, entry_price, stop_loss, target)
+            log.info("BUY ORDER PLACED | %s | qty=%d | entry=%.2f | SL=%.2f | target=%.2f",
+                    symbol, quantity, entry_price, stop_loss, target)
             return resp
         except Exception as e:
             log.error("place_bracket_order %s: %s", symbol, e)

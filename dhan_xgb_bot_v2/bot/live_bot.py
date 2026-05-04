@@ -236,10 +236,9 @@ class LiveBot:
     # =========================================================
     def sync_with_dhan(self):
         """
-        Live mode only.
-        Cross-checks bot's open trades against Dhan's actual positions.
-        If Dhan shows a position closed (bracket SL or target hit),
-        updates bot memory so we don't monitor a ghost position.
+        Live mode only — syncs bot memory with Dhan actual positions.
+        Since we use simple LIMIT orders (not bracket), positions only
+        disappear from Dhan if manually sold or bot's market sell fired.
         """
         if BOT_MODE != "live":
             return
@@ -249,18 +248,16 @@ class LiveBot:
         try:
             dhan_positions = self.broker.get_positions()
 
+            # SAFETY GUARD: if API returns empty, could be a glitch
+            # Only act if we have multiple confirmation attempts
             if dhan_positions.empty:
-                # Dhan shows no open positions — close everything in bot memory
-                for symbol, trade in list(self.trades.items()):
-                    log.warning("%s: No position on Dhan -- syncing (SL/target hit?)",
-                                symbol)
-                    ltp = self.broker.get_ltp(str(trade.security_id), symbol)
-                    exit_price = ltp if ltp > 0 else trade.stop_loss
-                    self._exit_trade(trade, exit_price, "CLOSED_ON_DHAN")
-                    self.sl_blacklist.add(symbol)
+                log.warning("sync_with_dhan: Dhan returned no positions "
+                            "-- could be API glitch, skipping auto-close")
+                # Do NOT auto-close here — bot's 60s monitor will catch
+                # real SL hits via LTP check. Only log the warning.
                 return
 
-            # Build set of symbols currently open on Dhan
+            # Build set of symbols open on Dhan
             col = None
             for c in ["tradingSymbol", "trading_symbol", "symbol"]:
                 if c in dhan_positions.columns:
@@ -268,15 +265,16 @@ class LiveBot:
                     break
 
             if col is None:
-                log.warning("sync_with_dhan: cannot find symbol column in positions")
+                log.warning("sync_with_dhan: cannot find symbol column")
                 return
 
             open_on_dhan = set(dhan_positions[col].str.upper().tolist())
+            log.debug("sync_with_dhan: open on Dhan = %s", open_on_dhan)
 
             for symbol, trade in list(self.trades.items()):
                 if symbol.upper() not in open_on_dhan:
-                    log.warning("%s: Closed on Dhan (bracket SL/target hit) -- syncing",
-                                symbol)
+                    log.warning("%s: Not found in Dhan positions -- manually "
+                                "sold or order rejected?", symbol)
                     ltp = self.broker.get_ltp(str(trade.security_id), symbol)
                     exit_price = ltp if ltp > 0 else trade.stop_loss
                     self._exit_trade(trade, exit_price, "CLOSED_ON_DHAN")
@@ -329,9 +327,13 @@ class LiveBot:
             result = self.engine.score(df)
             if result["signal"] == "BUY":
                 candidates.append((symbol, sec_id, result))
-                log.info("  Candidate: %s prob=%.3f [%s]",
-                         symbol, result["prob_up"], stock_sector)
-
+                entry = result["entry"]
+                atr   = result["atr"]
+                sl    = self.risk.calc_stop_loss(entry, atr, TRADE_MODE)
+                target= self.risk.calc_target(entry, sl)
+                log.info("  Candidate: %s prob=%.3f | CP=%.2f | SL=%.2f | TP=%.0f [%s]",
+                          symbol, result["prob_up"], entry, sl, target, stock_sector)
+               
         # Step 2: Pick best signal
         if not candidates:
             log.info("No BUY signals this scan.")
