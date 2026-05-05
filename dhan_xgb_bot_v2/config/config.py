@@ -19,17 +19,17 @@ TELEGRAM_CHAT_ID_1= os.getenv("TELEGRAM_CHAT_ID_1", "")
 TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 
 # ── Capital & risk ──────────────────────────────────────────
-CAPITAL              = 150_000      # update as you scale
+CAPITAL              = 60000       # update as you scale
 MAX_RISK_PCT         = 0.02        # 2% risk per trade (Rs.1,000 on Rs.50k)
-MAX_CAPITAL_PER_TRADE= 0.18        # never put more than 90% in one trade
+MAX_CAPITAL_PER_TRADE= 0.46        # never put more than 45% in one trade
 DAILY_LOSS_LIMIT     = 0.06        # circuit breaker: halt if -6% on the day
 
 # ── Trade mode ──────────────────────────────────────────────
 TRADE_MODE           = "cnc"       # CNC delivery (shares go to demat)
 AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
-AUTO_EXIT_TIME       = "14:45"     # time to check for same-day exit
-MAX_OPEN_TRADES      = 5          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
+AUTO_EXIT_TIME       = "15:15"     # time to check for same-day exit
+MAX_OPEN_TRADES      = 2          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
 NO_NEW_TRADE_BEFORE = "09:30"   # wait 15 min for market to settle
 # ── XGBoost signal thresholds ───────────────────────────────
 BUY_THRESHOLD        = 0.65
@@ -86,7 +86,7 @@ BACKUP_SCALER_PATH   = "models/scaler_backup.pkl"
 # ── Market hours IST ────────────────────────────────────────
 MARKET_OPEN          = "09:15"
 MARKET_CLOSE         = "15:30"
-NO_NEW_TRADE_AFTER   = "14:00"
+NO_NEW_TRADE_AFTER   = "15:00"
 INTRADAY_CUTOFF      = "15:22"  # was "15:10" — CNC can hold until 3:22 PM
 
 # ── Logging ─────────────────────────────────────────────────
