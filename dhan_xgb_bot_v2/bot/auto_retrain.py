@@ -1,240 +1,439 @@
 # ============================================================
-#  bot/auto_retrain.py  —  Weekly scheduled retrainer
+# bot/auto_retrain.py — Nightly / scheduled walk-forward
+#                        retraining for the live bot
+#
+# Fully aligned with:
+#   trade_policy.py  — ATR_SL_MULT, ATR_TP_MULT, HORIZON
+#   data/features.py — build_features(), FEATURE_COLS
+#   models/train.py  — identical label logic, same XGB params,
+#                      same deployment gate thresholds
+#   config/config.py — MODEL_PATH, SCALER_PATH, BACKUP_*,
+#                      RETRAIN_LOG, NIFTY50_SECURITY_ID, WATCHLIST
+#
+# Invocation:
+#   python -m bot.auto_retrain            # manual / test
+#   cron: 0 18 * * 1-5  python -m bot.auto_retrain
+#
+# Flow:
+#   1. Fetch last RETRAIN_DAYS days of 5-min candles (broker + CSV fallback)
+#   2. build_features() — same pipeline as train.py
+#   3. _make_atr_labels() — identical path-dependent label logic
+#   4. Walk-forward OOS evaluation (N_SPLITS folds)
+#   5. Deployment gate — same MIN_ACC / MIN_AUC / MIN_PREC as train.py
+#   6. Gate pass  -> backup old model, save new model, Telegram success alert
+#   7. Gate fail  -> keep old model, Telegram warning alert
 # ============================================================
-"""
-Runs every Sunday at 8:00 PM automatically via Task Scheduler.
-Steps:
-  1. Download fresh data (last 60 days)
-  2. Merge this week's live trades into training data
-  3. Retrain XGBoost
-  4. Validate accuracy — only deploy if better than old model
-  5. Roll back if new model is worse
-  6. Send Telegram summary
-"""
 
-import os, sys, pickle, shutil, logging
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from __future__ import annotations
 
-import pandas as pd
+import logging
+import os
+import pickle
+import shutil
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import numpy as np
-from datetime import datetime
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score
+import pandas as pd
 import xgboost as xgb
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 
-from data.features   import build_features, FEATURE_COLS
-from config.config   import MODEL_PATH, SCALER_PATH, TRADE_LOG
-from bot.telegram_alert import _send
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
+from data.features import build_features, FEATURE_COLS
+from bot.trade_policy import ATR_SL_MULT, ATR_TP_MULT, HORIZON
+from config.config import (
+    WATCHLIST,
+    MODEL_PATH,
+    SCALER_PATH,
+    BACKUP_MODEL_PATH,
+    BACKUP_SCALER_PATH,
+    RETRAIN_LOG,
+    NIFTY50_SECURITY_ID,
+)
+
+os.makedirs(ROOT / "logs",   exist_ok=True)
+os.makedirs(ROOT / "models", exist_ok=True)
+
+logging.basicConfig(
+    level    = logging.INFO,
+    format   = "%(asctime)s  %(levelname)-8s  %(message)s",
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(RETRAIN_LOG, mode="a", encoding="utf-8"),
+    ],
+)
 log = logging.getLogger("auto_retrain")
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    handlers=[logging.FileHandler("logs/retrain.log"), logging.StreamHandler()])
 
-BACKUP_MODEL  = "models/xgb_model_backup.pkl"
-BACKUP_SCALER = "models/scaler_backup.pkl"
-MIN_ACCURACY_IMPROVEMENT = -0.005   # allow up to 0.5% drop — within noise
+# ── Rolling retraining window ────────────────────────────────
+# IMPORTANT:
+# Markets are non-stationary.
+# Old market structure becomes statistically irrelevant over time.
+#
+# We therefore train ONLY on recent market behavior.
+#
+# Default:
+#   last 90 trading days (~3 months)
+#
+# This dramatically improves:
+#   • regime adaptation
+#   • volatility responsiveness
+#   • post-news behavior learning
+#   • recent liquidity dynamics
+#
+# Avoids:
+#   • stale COVID-era patterns
+#   • dead momentum structures
+#   • obsolete intraday volatility clusters
+#
+RETRAIN_DAYS = int(os.getenv("RETRAIN_DAYS", "90"))
+
+# Walk-forward folds
+N_SPLITS = int(os.getenv("N_SPLITS", "5"))
+
+# ── Deployment gate — IDENTICAL to models/train.py ───────────
+MIN_ACC  = 0.53
+MIN_AUC  = 0.55
+MIN_PREC = 0.50
+MIN_ROWS = 500    # minimum labelled rows to bother retraining
+
+# ── XGBoost params — IDENTICAL to models/train.py ────────────
+PARAMS = dict(
+    objective          = "binary:logistic",
+    eval_metric        = "logloss",
+    n_estimators       = 500,
+    max_depth          = 4,
+    learning_rate      = 0.035,
+    subsample          = 0.75,
+    colsample_bytree   = 0.75,
+    colsample_bylevel  = 0.75,
+    min_child_weight   = 15,
+    gamma              = 0.15,
+    reg_alpha          = 0.2,
+    reg_lambda         = 1.5,
+    random_state       = 42,
+    n_jobs             = -1,
+    tree_method        = "hist",
+    early_stopping_rounds = 30,
+)
 
 
-# ── Step 1: Load all available data ──────────────────────────
-def load_all_data():
-    from data.download_data import NIFTY50_SYMBOLS
-    import yfinance as yf
+# ─────────────────────────────────────────────────────────────
+#  Data loading  (broker-first, CSV fallback)
+# ─────────────────────────────────────────────────────────────
+def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Fetch last RETRAIN_DAYS days of 5-min OHLCV for all watchlist stocks
+    plus Nifty index via DhanBroker. Falls back to historical CSV per
+    symbol if the broker call fails.
+    """
+    from bot.dhan_api import DhanBroker
+    broker   = DhanBroker()
+    hist_dir = ROOT / "data" / "historical"
+    nifty_path = ROOT / "data" / "raw" / "NIFTY50.csv"
+    cutoff   = datetime.now() - timedelta(days=RETRAIN_DAYS)
+    frames: list[pd.DataFrame] = []
 
-    log.info("Downloading fresh 60-day data...")
-    frames = []
-    for sym in NIFTY50_SYMBOLS[:10]:   # top 10 for speed
+    for symbol, sec_id in WATCHLIST.items():
         try:
-            df = yf.download(f"{sym}.NS", period="60d",
-                             interval="5m", auto_adjust=True, progress=False)
+            df = broker.get_candles(sec_id, symbol, days_back=RETRAIN_DAYS)
             if df.empty:
-                continue
-            df.index.name = "datetime"
-            df.columns    = ["open","high","low","close","volume"]
-            df = df.dropna()
-            df.to_csv(f"data/historical/{sym}_5min.csv")
+                raise ValueError("empty broker response")
+            if "datetime" not in df.columns:
+                df = df.reset_index().rename(columns={"index": "datetime"})
+
+            df["symbol"] = symbol
+
+            # Strict rolling-window enforcement
+            if "datetime" in df.columns:
+                df = df[df["datetime"] >= cutoff]
+
             frames.append(df)
-            log.info("  %s: %d rows", sym, len(df))
+            log.info("  broker: %-14s  %d candles", symbol, len(df))
         except Exception as e:
-            log.warning("  %s failed: %s", sym, e)
+            csv_path = hist_dir / f"{symbol}_5min.csv"
+            if csv_path.exists():
+                try:
+                    fb = pd.read_csv(csv_path, parse_dates=["datetime"])
+                    fb = fb[fb["datetime"] >= cutoff]
+                    fb["symbol"] = symbol
+                    frames.append(fb)
+                    log.warning("  %s: broker fail (%s) — CSV fallback (%d rows)",
+                                symbol, e, len(fb))
+                except Exception as e2:
+                    log.warning("  %s: CSV fallback also failed: %s", symbol, e2)
+            else:
+                log.warning("  %s: no data source available — skipped.", symbol)
 
-    return pd.concat(frames).sort_index() if frames else pd.DataFrame()
+    if not frames:
+        raise RuntimeError(
+            "No stock data fetched from broker or CSV. Cannot retrain."
+        )
+    stock_df = pd.concat(frames, ignore_index=True)
+
+    # ── Nifty index ───────────────────────────────────────────
+    nifty_df = pd.DataFrame()
+    try:
+        nd = broker.get_candles(NIFTY50_SECURITY_ID, "NIFTY50",
+                                days_back=RETRAIN_DAYS)
+        if not nd.empty:
+            if "datetime" not in nd.columns:
+                nd = nd.reset_index().rename(columns={"index": "datetime"})
+            nifty_df = nd
+            log.info("  Nifty: %d candles (broker)", len(nifty_df))
+    except Exception as e:
+        if nifty_path.exists():
+            nifty_df = pd.read_csv(nifty_path, parse_dates=["datetime"])
+            nifty_df = nifty_df[nifty_df["datetime"] >= cutoff]
+            log.warning("  Nifty broker failed (%s) — CSV fallback (%d rows)",
+                        e, len(nifty_df))
+        else:
+            log.warning("  Nifty unavailable — index features will be 0.")
+
+    return stock_df, nifty_df
 
 
-# ── Step 2: Merge live trade outcomes ─────────────────────────
-def load_live_trade_features():
+# ─────────────────────────────────────────────────────────────
+#  ATR path-dependent label
+#  IDENTICAL to _make_atr_labels() in models/train.py
+# ─────────────────────────────────────────────────────────────
+def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
     """
-    Reads trades.csv and extracts the feature rows that led to
-    winning and losing trades — feeds them back as training labels.
+    Label = 1 (BUY) if TP hit before SL within HORIZON bars.
+    Exactly mirrors the label used during initial training.
     """
-    if not os.path.exists(TRADE_LOG):
-        log.info("No live trade log yet — skipping live data merge.")
-        return pd.DataFrame()
+    feat   = feat.copy().sort_values(["symbol", "datetime"]).reset_index(drop=True)
+    groups = []
+    for sym, g in feat.groupby("symbol", sort=False):
+        g   = g.reset_index(drop=True)
+        c   = g["close"].values
+        h   = g["high"].values
+        l   = g["low"].values
+        atr = g["atr_14"].values
+        n   = len(g)
+        lbl = np.zeros(n, dtype=int)
+        for i in range(n - HORIZON):
+            entry = c[i];  a = atr[i]
+            if a <= 0 or np.isnan(a):
+                continue
+            tp = entry + ATR_TP_MULT * a
+            sl = entry - ATR_SL_MULT * a
+            tp_hit = sl_hit = False
+            for j in range(i + 1, min(i + 1 + HORIZON, n)):
+                if l[j] <= sl:
+                    sl_hit = True;  break
+                if h[j] >= tp:
+                    tp_hit = True;  break
+            lbl[i] = 1 if (tp_hit and not sl_hit) else 0
+        g["target"] = lbl
+        groups.append(g)
+    return pd.concat(groups, ignore_index=True)
 
-    trades = pd.read_csv(TRADE_LOG)
-    entries = trades[trades["action"] == "ENTRY"]
-    exits   = trades[trades["action"] == "EXIT"]
 
-    if exits.empty:
-        return pd.DataFrame()
-
-    # Build outcome labels: win=1, loss=0
-    results = []
-    for _, ex in exits.iterrows():
-        pnl = float(ex["pnl"]) if ex["pnl"] != "" else 0
-        results.append({
-            "time":   ex["time"],
-            "symbol": ex["symbol"],
-            "label":  1 if pnl > 0 else 0,
-        })
-
-    log.info("Live trades this week: %d wins, %d losses",
-             sum(r["label"] for r in results),
-             sum(1 - r["label"] for r in results))
-    return pd.DataFrame(results)
-
-
-# ── Step 3: Retrain ───────────────────────────────────────────
-def retrain(df: pd.DataFrame):
-    from sklearn.preprocessing import StandardScaler
-
-    log.info("Building features for %d rows...", len(df))
-    feat = build_features(df)
-    X    = feat[FEATURE_COLS]
-    y    = feat["target"]
-
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_scaled = pd.DataFrame(X_scaled, columns=FEATURE_COLS, index=X.index)
-
-    params = {
-        "objective":        "binary:logistic",
-        "n_estimators":     500,
-        "max_depth":        4,
-        "learning_rate":    0.05,
-        "subsample":        0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 10,
-        "reg_alpha":        0.1,
-        "reg_lambda":       1.0,
-        "n_jobs":           -1,
-        "random_state":     42,
-        "tree_method":      "hist",
+# ─────────────────────────────────────────────────────────────
+#  Walk-forward OOS evaluation
+# ─────────────────────────────────────────────────────────────
+def _walk_forward(X: np.ndarray, y: np.ndarray) -> dict:
+    tscv = TimeSeriesSplit(n_splits=N_SPLITS)
+    accs, aucs, precs, recalls = [], [], [], []
+    for fold, (tr_idx, te_idx) in enumerate(tscv.split(X), 1):
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+        scale_pos  = max(1.0, (y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
+        sc  = StandardScaler()
+        Xt  = sc.fit_transform(X_tr)
+        Xe  = sc.transform(X_te)
+        p   = {**PARAMS, "scale_pos_weight": scale_pos}
+        p.pop("early_stopping_rounds", None)
+        m   = xgb.XGBClassifier(**p)
+        m.fit(Xt, y_tr, verbose=False)
+        yp  = m.predict(Xe)
+        yq  = m.predict_proba(Xe)[:, 1]
+        rep = classification_report(y_te, yp, output_dict=True, zero_division=0)
+        accs.append(accuracy_score(y_te, yp))
+        aucs.append(roc_auc_score(y_te, yq))
+        precs.append(rep.get("1", {}).get("precision", 0.0))
+        recalls.append(rep.get("1", {}).get("recall",  0.0))
+        log.info("  Fold %d: acc=%.3f AUC=%.3f prec=%.3f recall=%.3f  "
+                 "(train=%d test=%d)",
+                 fold, accs[-1], aucs[-1], precs[-1], recalls[-1],
+                 len(X_tr), len(X_te))
+    return {
+        "acc":    float(np.mean(accs)),
+        "auc":    float(np.mean(aucs)),
+        "prec":   float(np.mean(precs)),
+        "recall": float(np.mean(recalls)),
     }
 
-    # Cross-validate
-    tscv   = TimeSeriesSplit(n_splits=5)
-    scores = []
-    for tr, val in tscv.split(X_scaled):
-        m = xgb.XGBClassifier(**params)
-        m.fit(X_scaled.iloc[tr], y.iloc[tr], verbose=False)
-        scores.append(accuracy_score(y.iloc[val], m.predict(X_scaled.iloc[val])))
 
-    new_accuracy = float(np.mean(scores))
-    log.info("New model CV accuracy: %.2f%%", new_accuracy * 100)
+# ─────────────────────────────────────────────────────────────
+#  Train final model on full data
+# ─────────────────────────────────────────────────────────────
+def _train_final(X: np.ndarray, y: np.ndarray) -> tuple:
+    split       = int(len(X) * 0.85)
+    X_tr, X_val = X[:split], X[split:]
+    y_tr, y_val = y[:split], y[split:]
+    scale_pos   = max(1.0, (y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
+    scaler      = StandardScaler()
+    X_tr_s      = scaler.fit_transform(X_tr)
+    X_val_s     = scaler.transform(X_val)
+    p           = {**PARAMS, "scale_pos_weight": scale_pos}
+    model       = xgb.XGBClassifier(**p)
+    model.fit(
+        X_tr_s, y_tr,
+        eval_set = [(X_val_s, y_val)],
+        verbose  = 50,
+    )
+    return model, scaler
 
-    # Final model
-    model = xgb.XGBClassifier(**params)
-    model.fit(X_scaled, y, verbose=False)
-    return model, scaler, new_accuracy
+
+# ─────────────────────────────────────────────────────────────
+#  Deployment gate
+# ─────────────────────────────────────────────────────────────
+def _gate_passes(metrics: dict, n: int) -> bool:
+    checks = {
+        f"acc  {metrics['acc']:.3f}  >= {MIN_ACC}":  metrics["acc"]  >= MIN_ACC,
+        f"AUC  {metrics['auc']:.3f}  >= {MIN_AUC}":  metrics["auc"]  >= MIN_AUC,
+        f"prec {metrics['prec']:.3f} >= {MIN_PREC}":  metrics["prec"] >= MIN_PREC,
+        f"rows {n:,} >= {MIN_ROWS}":                  n               >= MIN_ROWS,
+    }
+    log.info("── Deployment Gate ──")
+    all_pass = True
+    for desc, ok in checks.items():
+        log.info("  %s  %s", "✅" if ok else "❌", desc)
+        if not ok:
+            all_pass = False
+    return all_pass
 
 
-# ── Step 4: Validate vs old model ────────────────────────────
-def get_old_accuracy():
-    """Quick re-score of old model on latest data."""
+# ─────────────────────────────────────────────────────────────
+#  Telegram helper
+# ─────────────────────────────────────────────────────────────
+def _notify(msg: str):
     try:
-        with open(MODEL_PATH,  "rb") as f: old_model  = pickle.load(f)
-        with open(SCALER_PATH, "rb") as f: old_scaler = pickle.load(f)
-
-        frames = []
-        for f in os.listdir("data/historical"):
-            if f.endswith(".csv"):
-                d = pd.read_csv(f"data/historical/{f}",
-                                parse_dates=["datetime"], index_col="datetime")
-                d.columns = d.columns.str.lower()
-                frames.append(d)
-        if not frames:
-            return 0.0
-
-        df   = pd.concat(frames).sort_index()
-        feat = build_features(df)
-        X    = feat[FEATURE_COLS]
-        y    = feat["target"]
-
-        X_sc = old_scaler.transform(X)
-        preds= old_model.predict(X_sc)
-        return accuracy_score(y, preds)
-    except Exception:
-        return 0.0
+        from bot.telegram_alert import _send
+        _send(msg)
+    except Exception as e:
+        log.warning("Telegram notify failed: %s", e)
 
 
-# ── Step 5: Save or rollback ──────────────────────────────────
-def deploy_model(model, scaler, new_acc, old_acc):
-    if new_acc >= old_acc + MIN_ACCURACY_IMPROVEMENT:
-        # Backup old first
-        if os.path.exists(MODEL_PATH):
-            shutil.copy(MODEL_PATH,  BACKUP_MODEL)
-            shutil.copy(SCALER_PATH, BACKUP_SCALER)
+# ─────────────────────────────────────────────────────────────
+#  Main entry point
+# ─────────────────────────────────────────────────────────────
+def retrain():
+    log.info("=" * 58)
+    log.info("  AUTO-RETRAIN  %s", datetime.now().strftime("%Y-%m-%d %H:%M IST"))
+    log.info("  Window: %d days | Stocks: %d", RETRAIN_DAYS, len(WATCHLIST))
+    log.info("=" * 58)
+
+    # 1. Fetch data
+    try:
+        stock_df, nifty_df = _fetch_recent_candles()
+    except RuntimeError as e:
+        log.error("Data fetch failed: %s", e)
+        _notify(f"❌ <b>Auto-retrain FAILED</b>\nData error: {e}")
+        return
+
+    n_symbols = stock_df["symbol"].nunique()
+    log.info("Fetched %d candles across %d symbols", len(stock_df), n_symbols)
+
+    # 2. Build features
+    log.info("Building features...")
+    try:
+        feat = build_features(stock_df, nifty_df=nifty_df if not nifty_df.empty else None)
+    except Exception as e:
+        log.error("Feature build failed: %s", e)
+        _notify(f"❌ <b>Auto-retrain FAILED</b>\nFeature error: {e}")
+        return
+
+    # 3. ATR path-dependent labels
+    log.info("Creating ATR labels (HORIZON=%d)...", HORIZON)
+    feat = feat.drop(columns=["target"], errors="ignore")
+    feat = _make_atr_labels(feat)
+    feat = feat.dropna(subset=FEATURE_COLS + ["target"]).reset_index(drop=True)
+
+    X = feat[FEATURE_COLS].values.astype(np.float32)
+    #y = feat["target"].values.astype(int)
+    np.random.seed(42)
+    print("RANDOM LABEL TEST ACTIVE")
+    y = np.random.randint(0, 2, size=len(feat))
+    
+    pos_rate = y.mean() * 100
+    log.info("Dataset: %d rows | BUY=%.1f%%  HOLD=%.1f%%", len(X), pos_rate, 100 - pos_rate)
+
+    if pos_rate > 70 or pos_rate < 10:
+        log.warning("Label imbalance %.1f%% BUY — check ATR_TP_MULT/HORIZON in trade_policy.py",
+                    pos_rate)
+
+    if len(X) < MIN_ROWS:
+        log.warning("Too few rows (%d < %d) — retrain skipped.", len(X), MIN_ROWS)
+        _notify(f"⚠️ <b>Retrain skipped</b>\nOnly {len(X)} rows (min={MIN_ROWS})")
+        return
+
+    # 4. Walk-forward evaluation
+    log.info("Walk-forward OOS evaluation (%d folds)...", N_SPLITS)
+    metrics = _walk_forward(X, y)
+    log.info("OOS: acc=%.3f  AUC=%.3f  prec=%.3f  recall=%.3f",
+             metrics["acc"], metrics["auc"], metrics["prec"], metrics["recall"])
+
+    # 5. Deployment gate
+    if not _gate_passes(metrics, len(X)):
+        msg = (
+            f"❌ <b>Retrain gate FAILED — old model kept</b>\n"
+            f"Date  : {datetime.now().strftime('%Y-%m-%d')}\n"
+            f"acc   : {metrics['acc']:.3f}  (min {MIN_ACC})\n"
+            f"AUC   : {metrics['auc']:.3f}  (min {MIN_AUC})\n"
+            f"prec  : {metrics['prec']:.3f}  (min {MIN_PREC})\n"
+            f"rows  : {len(X):,}\n"
+            f"BUY%  : {pos_rate:.1f}%\n"
+            f"Tip   : more data or adjust ATR_TP_MULT in trade_policy.py"
+        )
+        log.warning("Gate FAILED — keeping old model.")
+        _notify(msg)
+        return
+
+    # 6. Train final model
+    log.info("Gate passed — training final model on full dataset...")
+    try:
+        model, scaler = _train_final(X, y)
+    except Exception as e:
+        log.error("Final training failed: %s", e)
+        _notify(f"❌ <b>Auto-retrain FAILED</b>\nTraining error: {e}")
+        return
+
+    # 7. Backup old, deploy new
+    try:
+        if Path(MODEL_PATH).exists():
+            shutil.copy2(MODEL_PATH,  BACKUP_MODEL_PATH)
+            shutil.copy2(SCALER_PATH, BACKUP_SCALER_PATH)
+            log.info("Old model backed up -> %s", BACKUP_MODEL_PATH)
 
         with open(MODEL_PATH,  "wb") as f: pickle.dump(model,  f)
         with open(SCALER_PATH, "wb") as f: pickle.dump(scaler, f)
-
-        log.info("New model deployed. Accuracy: %.2f%% (was %.2f%%)",
-                 new_acc * 100, old_acc * 100)
-        return True, "deployed"
-    else:
-        log.warning("New model worse (%.2f%% vs %.2f%%). Keeping old model.",
-                    new_acc * 100, old_acc * 100)
-        return False, "rolled_back"
-
-
-# ── Step 6: Telegram summary ──────────────────────────────────
-def send_retrain_summary(new_acc, old_acc, status, trade_count):
-    date_str = datetime.now().strftime("%d %b %Y")
-    emoji    = "✅" if status == "deployed" else "⚠️"
-    status_str = "New model deployed" if status == "deployed" else "Old model kept (new was worse)"
-
-    msg = (
-        f"{emoji} <b>WEEKLY RETRAIN — {date_str}</b>\n"
-        f"{'─' * 28}\n"
-        f"📊 <b>New accuracy</b>  : {new_acc*100:.1f}%\n"
-        f"📊 <b>Old accuracy</b>  : {old_acc*100:.1f}%\n"
-        f"📈 <b>Trades learned</b>: {trade_count} this week\n"
-        f"🔄 <b>Status</b>        : {status_str}\n"
-        f"⏰ <b>Next retrain</b>  : Next Sunday 8:00 PM\n\n"
-        f"Bot is ready for Monday trading."
-    )
-    _send(msg)
-
-
-# ── Main ──────────────────────────────────────────────────────
-def run_retrain():
-    log.info("=" * 50)
-    log.info("Weekly retraining started — %s",
-             datetime.now().strftime("%Y-%m-%d %H:%M"))
-
-    # Check it's Sunday (skip if run manually on other days in production)
-    # Comment out next 3 lines if you want to run manually anytime
-    # if datetime.now().weekday() != 6:
-    #     log.info("Not Sunday — skipping auto-retrain.")
-    #     return
-
-    df           = load_all_data()
-    live_trades  = load_live_trade_features()
-    trade_count  = len(live_trades)
-
-    if df.empty:
-        log.error("No data available. Retrain aborted.")
+        log.info("New model saved -> %s", MODEL_PATH)
+    except Exception as e:
+        log.error("Model save failed: %s", e)
+        _notify(f"❌ <b>Auto-retrain FAILED</b>\nSave error: {e}")
         return
 
-    old_acc              = get_old_accuracy()
-    model, scaler, new_acc = retrain(df)
-    deployed, status     = deploy_model(model, scaler, new_acc, old_acc)
-    send_retrain_summary(new_acc, old_acc, status, trade_count)
-
-    log.info("Retraining complete. Status: %s", status)
-    log.info("=" * 50)
+    # 8. Success notification
+    _notify(
+        f"✅ <b>Auto-retrain DEPLOYED</b>\n"
+        f"Date   : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"Window : {RETRAIN_DAYS}d | {n_symbols} stocks\n"
+        f"Rows   : {len(X):,} | BUY%={pos_rate:.1f}%\n"
+        f"acc    : {metrics['acc']:.3f}\n"
+        f"AUC    : {metrics['auc']:.3f}\n"
+        f"prec   : {metrics['prec']:.3f}\n"
+        f"recall : {metrics['recall']:.3f}\n"
+        f"Model  : {MODEL_PATH}"
+    )
+    log.info("Retrain complete — new model is live.")
 
 
 if __name__ == "__main__":
-    run_retrain()
+    retrain()

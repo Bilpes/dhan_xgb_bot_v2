@@ -19,18 +19,19 @@ TELEGRAM_CHAT_ID_1= os.getenv("TELEGRAM_CHAT_ID_1", "")
 TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 
 # ── Capital & risk ──────────────────────────────────────────
-CAPITAL              = 60000       # update as you scale
-MAX_RISK_PCT         = 0.02        # 2% risk per trade (Rs.1,000 on Rs.50k)
-MAX_CAPITAL_PER_TRADE= 0.46        # never put more than 45% in one trade
-DAILY_LOSS_LIMIT     = 0.06        # circuit breaker: halt if -6% on the day
+CAPITAL              = 100000      # update as you scale
+MAX_RISK_PCT         = 0.01        # 2% risk per trade (Rs.1,000 on Rs.50k)
+MAX_CAPITAL_PER_TRADE= 0.25        # never put more than 25% in one trade
+DAILY_LOSS_LIMIT     = 0.04        # circuit breaker: halt if -4% on the day
 
 # ── Trade mode ──────────────────────────────────────────────
 TRADE_MODE           = "cnc"       # CNC delivery (shares go to demat)
 AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
 AUTO_EXIT_TIME       = "15:15"     # time to check for same-day exit
-MAX_OPEN_TRADES      = 2          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
-NO_NEW_TRADE_BEFORE = "09:30"   # wait 15 min for market to settle
+MAX_OPEN_TRADES      = 3          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
+NO_NEW_TRADE_BEFORE  = "09:30"   # wait 15 min for market to settle
+ALLOW_SHORTS         = False
 # ── XGBoost signal thresholds ───────────────────────────────
 BUY_THRESHOLD        = 0.65
 SELL_THRESHOLD       = 0.38
@@ -41,13 +42,19 @@ ATR_MULTIPLIER_CNC   = 2.5         # wider stop for overnight holds
 ATR_MULTIPLIER_INTRA = 1.5         # tighter stop for intraday
 
 # ── Trailing stop ───────────────────────────────────────────
-TRAIL_AFTER_PCT      = 0.010       # activate after +1.5% profit
-TRAIL_DISTANCE       = 0.007       # trail 1% below running high
+TRAIL_AFTER_PCT      = 0.01       # activate after +1.5% profit
+TRAIL_DISTANCE       = 0.005       # trail 1% below running high
 
 # ── position rotation ───────────────────────────────────────────
 ROTATION_ENABLED     = True    # allow switching to better opportunity
 ROTATION_MIN_PROFIT  = 0.005   # only rotate if current position up 0.5%+
 ROTATION_MIN_EDGE    = 0.05    # new signal must be 5% more confident
+
+# ===== ML =====
+MODEL_THRESHOLD = 0.60
+MIN_VOLUME_RATIO = 1.2
+MIN_ATR_PCT = 0.003
+
 # ── Nifty 50 watchlist ──────────────────────────────────────
 # Auto-loaded from config/watchlist.json
 # Generate this file by running:  python data/load_instruments.py

@@ -126,18 +126,23 @@ class DhanBroker:
         cached = self._quote_cache.get(sid)
         if cached and (now - cached[1]) < self._quote_cache_ttl:
             return cached[0]
+
         payload = {"NSE_EQ": [int(sid)]}
         resp, dhan_success, attempts = self._post_with_retries("/marketfeed/quote", payload, timeout=6)
         meta = {"dhan_success": False, "partial_success": False, "fallback_used": False, "attempts": attempts}
+
         if resp is None:
             log.warning("get_quote %s: failed after %d attempts", symbol or sid, attempts)
             return {"meta": meta}
+
         if resp.status_code != 200:
             log.warning("get_quote %s: HTTP %d", symbol or sid, resp.status_code)
             return {"meta": meta}
+
         try:
             data = resp.json() if resp.content else {}
             node = (data.get("data") or {}).get("NSE_EQ", {})
+
             q = None
             if isinstance(node, dict):
                 q = node.get(sid)
@@ -145,24 +150,62 @@ class DhanBroker:
                     q = next(iter(node.values()))
             elif isinstance(node, list) and node:
                 q = node[0]
+
             if not isinstance(q, dict):
                 log.warning("get_quote %s: unexpected quote structure", symbol or sid)
                 return {"meta": meta}
-            bid = q.get("best_bid_price") or q.get("bid_price") or q.get("bid") or q.get("bestBid") or q.get("bidPrice")
-            ask = q.get("best_ask_price") or q.get("ask_price") or q.get("ask") or q.get("bestAsk") or q.get("askPrice")
-            ltp = q.get("last_price") or q.get("ltp") or q.get("last_traded_price") or q.get("close") or 0
+
+            depth = q.get("depth") or {}
+            buy_depth = depth.get("buy") or []
+            sell_depth = depth.get("sell") or []
+
+            bid = (
+                q.get("best_bid_price")
+                or q.get("bid_price")
+                or q.get("bid")
+                or q.get("bestBid")
+                or q.get("bidPrice")
+            )
+
+            ask = (
+                q.get("best_ask_price")
+                or q.get("ask_price")
+                or q.get("ask")
+                or q.get("bestAsk")
+                or q.get("askPrice")
+            )
+
+            if bid in (None, "", 0, 0.0) and buy_depth and isinstance(buy_depth[0], dict):
+                bid = buy_depth[0].get("price")
+
+            if ask in (None, "", 0, 0.0) and sell_depth and isinstance(sell_depth[0], dict):
+                ask = sell_depth[0].get("price")
+
+            ltp = (
+                q.get("last_price")
+                or q.get("ltp")
+                or q.get("last_traded_price")
+                or (q.get("ohlc") or {}).get("close")
+                or q.get("close")
+                or 0
+            )
+
             vol = q.get("volume") or q.get("vol") or q.get("traded_quantity") or 0
-            bid_f = float(bid) if bid not in (None, "") else None
-            ask_f = float(ask) if ask not in (None, "") else None
+
+            bid_f = float(bid) if bid not in (None, "", 0, 0.0) else None
+            ask_f = float(ask) if ask not in (None, "", 0, 0.0) else None
             ltp_f = float(ltp) if ltp not in (None, "") else 0.0
             vol_f = float(vol) if vol not in (None, "") else 0.0
+
             if ltp_f <= 0:
                 ltp_f = self.get_ltp(sid, symbol)
+
             spread_abs = None
             spread_pct = None
             if bid_f is not None and ask_f is not None and ltp_f > 0:
                 spread_abs = ask_f - bid_f
                 spread_pct = spread_abs / ltp_f
+
             out = {
                 "bid": bid_f,
                 "ask": ask_f,
@@ -173,12 +216,14 @@ class DhanBroker:
                 "meta": {"dhan_success": True, "partial_success": False, "fallback_used": False, "attempts": attempts},
                 "raw": q,
             }
+
             self._quote_cache[sid] = (out, now)
             return out
+
         except Exception as e:
             log.warning("get_quote %s failed: %s", symbol or sid, e)
             return {"meta": meta}
-
+    
     def _get_ltp_yfinance(self, symbol: str) -> float:
         return 0.0
 

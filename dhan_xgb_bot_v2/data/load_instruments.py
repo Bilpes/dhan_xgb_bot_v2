@@ -123,6 +123,17 @@ NIFTY50_SYMBOLS = {
     "AUROPHARMA":  "pharma",
     "APOLLOHOSP":  "pharma",
     "TRENT":       "retail",
+    
+    #New list of 10 stocks added on 17th June 2024
+    "ABB":         "infra",
+    "DLF":         "realty",
+    "TATAMOTORS":  "auto",
+    "TVSMOTOR":    "auto",
+    "BHEL":        "infra",
+    "ZYDUSLIFE":   "pharma",
+    "ADANIPOWER":  "energy",
+    "IRFC":        "finance",
+    "INDIGO":      "consumer",
 }
 
 # ── Alternate spellings Dhan sometimes uses ─────────────────
@@ -140,6 +151,8 @@ SYMBOL_ALTERNATES = {
     "TATAMOTORS": ["TATAMOTORS", "TATA MOTORS", "TATAMTRDVR"],
     "ETERNAL":    ["ETERNAL", "ZOMATO"],
     "LTIM":       ["LTIM", "LTIMINDTREE", "LTI MINDTREE", "LTIM#"],
+    "INDIGO":     ["INDIGO", "INTERGLOBEAVIATION", "INTERGLOBE"],
+    "ZYDUSLIFE":  ["ZYDUSLIFE", "CADILAHC", "ZYDUS"],
 }
 
 

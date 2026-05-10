@@ -57,7 +57,7 @@ WATCHLIST_YF = {
     "TATACONSUM": "TATACONSUM.NS",
     # Auto
     "MARUTI":     "MARUTI.NS",
-    "M&M":        "MM.NS",           # special: & not supported
+    "M&M":        "M&M.NS",           # special: & not supported
     "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
     "EICHERMOT":  "EICHERMOT.NS",
     "HEROMOTOCO": "HEROMOTOCO.NS",
