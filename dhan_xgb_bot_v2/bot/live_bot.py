@@ -57,7 +57,7 @@ NEW_TRADE_LOSS_PAUSE    = float(os.getenv("NEW_TRADE_LOSS_PAUSE",   "-0.03"))
 NIFTY50_SECURITY_ID     = os.getenv("NIFTY50_SECURITY_ID",          "13")
 MONITOR_INTERVAL        = int(os.getenv("MONITOR_INTERVAL",         "60"))
 SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL",            "300"))
-AUTO_EXIT_TIME          = os.getenv("AUTO_EXIT_TIME",               "14:45")
+AUTO_EXIT_TIME          = os.getenv("AUTO_EXIT_TIME",               "15:15")
 AUTO_EXIT_THRESHOLD     = float(os.getenv("AUTO_EXIT_THRESHOLD",    "-0.01"))
 EOD_RESET_TIME          = os.getenv("EOD_RESET_TIME",               "15:30")
 
@@ -656,7 +656,7 @@ class LiveBot:
             return
 
         # ── Select highest-confidence signal ──────────────────
-        candidates.sort(key=lambda x: x[2]["prob_up"], reverse=True)
+        candidates.sort(key=lambda x: (x[2]["prob_up"] * 0.7+ x[2].get("atr_ratio", 1.0) * 0.3),reverse=True,)
         best_sym, best_sec_id, best_result, best_quote = candidates[0]
         log.info(
             "Best signal: %-14s prob=%.3f  (%d candidates ranked)",

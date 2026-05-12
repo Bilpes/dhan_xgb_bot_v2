@@ -29,11 +29,12 @@ TRADE_MODE           = "cnc"       # CNC delivery (shares go to demat)
 AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
 AUTO_EXIT_TIME       = "15:15"     # time to check for same-day exit
-MAX_OPEN_TRADES      = 3          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
+MAX_OPEN_TRADES      = 4          # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
+MAX_PER_SECTOR       = 1
 NO_NEW_TRADE_BEFORE  = "09:30"   # wait 15 min for market to settle
 ALLOW_SHORTS         = False
 # ── XGBoost signal thresholds ───────────────────────────────
-BUY_THRESHOLD        = 0.65
+BUY_THRESHOLD        = 0.75
 SELL_THRESHOLD       = 0.38
 
 # ── Stop-loss settings ──────────────────────────────────────
@@ -50,12 +51,45 @@ ROTATION_ENABLED     = True    # allow switching to better opportunity
 ROTATION_MIN_PROFIT  = 0.005   # only rotate if current position up 0.5%+
 ROTATION_MIN_EDGE    = 0.05    # new signal must be 5% more confident
 
-# ===== ML =====
-MODEL_THRESHOLD = 0.60
-MIN_VOLUME_RATIO = 1.2
-MIN_ATR_PCT = 0.003
 
-# ── Nifty 50 watchlist ──────────────────────────────────────
+# ===== ML =====
+MODEL_THRESHOLD   = 0.60
+MIN_VOLUME_RATIO  = 1.2
+MIN_ATR_PCT       = 0.003
+
+# ── Entry quality filters ─────────────────────────────
+REQUIRE_BREAKOUT_CONFIRMATION = True
+
+MIN_VOLUME_RATIO_CONFIRM = 1.5
+MIN_CANDLE_BODY_PCT      = 0.003
+MAX_DISTANCE_FROM_EMA20  = 0.025
+
+# ── Trend filters ───────────────────────────────────
+TREND_STRENGTH_ENABLED = True
+
+# Buy only if:
+# EMA20 > EMA50
+# AND close > VWAP
+REQUIRE_VWAP_CONFIRM   = True
+
+
+# ── Re-entry protection ─────────────────────────────
+# Prevent repeated entries in same stock after SL hit
+NO_REENTRY_MINUTES     = 60
+
+
+# ── Momentum extension filter ───────────────────────
+# Avoid chasing huge candles already extended from VWAP
+MAX_DISTANCE_FROM_VWAP = 0.02
+
+
+# ── Time filters ────────────────────────────────────
+# Avoid lunchtime chop
+AVOID_LUNCH_HOURS      = True
+LUNCH_START            = "12:00"
+LUNCH_END              = "13:15"
+# ── Nifty 50 watchlist ───────────────────────
+# ───────────────
 # Auto-loaded from config/watchlist.json
 # Generate this file by running:  python data/load_instruments.py
 # That script downloads Security IDs live from Dhan's master CSV

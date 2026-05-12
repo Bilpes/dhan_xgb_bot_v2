@@ -32,6 +32,7 @@ MIN_VOLUME_RATIO = 1.2     # avoid dead candles
 MIN_ATR_PCT      = 0.003   # avoid low volatility chop
 MODEL_THRESHOLD  = 0.60    # confidence threshold
 
+
 from data.features import build_features, FEATURE_COLS
 from bot.trade_policy import (
     ATR_PERIOD,
@@ -51,6 +52,9 @@ from config.config import (
     BACKUP_MODEL_PATH,
     BACKUP_SCALER_PATH,
     STOP_LOSS_PCT,
+    MIN_VOLUME_RATIO_CONFIRM,
+    MIN_CANDLE_BODY_PCT,
+    MAX_DISTANCE_FROM_EMA20,
 )
 
 log = logging.getLogger("signal_engine")
@@ -141,68 +145,98 @@ class SignalEngine:
         """
         Score the latest candle and return a signal dict.
 
-        Entry / SL / Target are computed with the SAME ATR multipliers
-        as train.py -> _make_atr_labels(), guaranteeing train-live parity.
+        Entry / SL / Target are computed with ATR-based volatility logic.
 
         Returns:
             {
                 "signal":  "BUY" | "HOLD",
-                "prob_up": float,      # model prob for class=1
-                "entry":   float,      # latest close
-                "sl":      float,      # entry - ATR_SL_MULT * ATR  (capped by STOP_LOSS_PCT)
-                "target":  float,      # entry + ATR_TP_MULT * ATR
-                "rr":      float,      # actual R:R
-                "atr":     float,      # ATR value used
-                "reason":  str,        # why HOLD if not BUY
+                "prob_up": float,
+                "entry":   float,
+                "sl":      float,
+                "target":  float,
+                "rr":      float,
+                "atr":     float,
+                "reason":  str,
             }
         """
+
+        # ─────────────────────────────────────────
+        # Basic validation
+        # ─────────────────────────────────────────
         if symbol.upper() in BLOCKED_SYMBOLS:
             return {**_NULL_RESULT, "reason": "blocked_symbol"}
 
         if df is None or df.empty or len(df) < 50:
             return {**_NULL_RESULT, "reason": "insufficient_data"}
 
+        # ─────────────────────────────────────────
+        # Feature generation
+        # ─────────────────────────────────────────
         try:
-            feat = build_features(df.copy(), nifty_df=self._nifty_df, symbol=symbol)
+            feat = build_features(
+                df.copy(),
+                nifty_df=self._nifty_df,
+                symbol=symbol
+            )
+
         except Exception as e:
             log.warning("%s: build_features failed: %s", symbol, e)
-            return {**_NULL_RESULT, "reason": f"feature_error:{e}"}
+
+            return {
+                **_NULL_RESULT,
+                "reason": f"feature_error:{e}"
+            }
 
         if feat.empty:
             return {**_NULL_RESULT, "reason": "empty_features"}
 
-        row     = feat.iloc[-1]
+        row = feat.iloc[-1]
+
         missing = [c for c in FEATURE_COLS if c not in feat.columns]
+
         if missing:
             log.warning("%s: missing features: %s", symbol, missing[:5])
-            return {**_NULL_RESULT, "reason": "missing_features"}
 
+            return {
+                **_NULL_RESULT,
+                "reason": "missing_features"
+            }
+
+        # ─────────────────────────────────────────
+        # Model prediction
+        # ─────────────────────────────────────────
         X_raw = row[FEATURE_COLS].values.reshape(1, -1).astype(np.float32)
+
         if np.isnan(X_raw).any():
-            return {**_NULL_RESULT, "reason": "nan_in_features"}
+            return {
+                **_NULL_RESULT,
+                "reason": "nan_in_features"
+            }
 
         try:
             X_scaled = self.scaler.transform(X_raw)
-            prob_up  = float(self.model.predict_proba(X_scaled)[0, 1])
+
+            prob_up = float(
+                self.model.predict_proba(X_scaled)[0, 1]
+            )
 
         except Exception as e:
             log.warning("%s: model predict failed: %s", symbol, e)
-            return {**_NULL_RESULT, "reason": f"predict_error:{e}"}
+
+            return {
+                **_NULL_RESULT,
+                "reason": f"predict_error:{e}"
+            }
 
         # ─────────────────────────────────────────
         # Trade quality filters
-        # Removes:
-        #   • fake breakouts
-        #   • low-volume candles
-        #   • lunchtime chop
-        #   • weak ML predictions
         # ─────────────────────────────────────────
-
         vol_ratio = float(row.get("vol_ratio", 0.0))
-        atr_pct   = float(row.get("atr_pct", 0.0)) 
+        atr_pct   = float(row.get("atr_pct", 0.0))
 
         # Volume filter
         if vol_ratio < MIN_VOLUME_RATIO:
+
             return {
                 **_NULL_RESULT,
                 "prob_up": round(prob_up, 4),
@@ -211,6 +245,7 @@ class SignalEngine:
 
         # Volatility filter
         if atr_pct < MIN_ATR_PCT:
+
             return {
                 **_NULL_RESULT,
                 "prob_up": round(prob_up, 4),
@@ -219,67 +254,244 @@ class SignalEngine:
 
         # ML confidence filter
         if prob_up < MODEL_THRESHOLD:
+
             return {
                 **_NULL_RESULT,
                 "prob_up": round(prob_up, 4),
                 "reason": f"low_confidence:{prob_up:.3f}",
             }
-        # ── ATR-based entry / SL / target (LIVE EXECUTION) ───
-        # Model was trained on %-based labels (TP_PCT=2.5%, SL_PCT=1.0%).
-        # Live SL/TP uses ATR for dynamic volatility-adjusted placement.
-        # These are intentionally different:
-        #   Train label → "predict 2.5% up before 1% down"
-        #   Live order  → "place SL at ATR_SL_MULT×ATR, TP at ATR_TP_MULT×ATR"
+
+        # ─────────────────────────────────────────
+        # Price + ATR
+        # ─────────────────────────────────────────
         entry = float(row.get("close", 0.0))
         atr   = float(row.get("atr_14", 0.0))
 
         if entry <= 0 or atr <= 0 or np.isnan(atr):
-            return {**_NULL_RESULT, "prob_up": prob_up, "reason": "invalid_atr_or_price"}
 
+            return {
+                **_NULL_RESULT,
+                "prob_up": prob_up,
+                "reason": "invalid_atr_or_price"
+            }
+
+        # ─────────────────────────────────────────
+        # ATR-based SL / Target
+        # ─────────────────────────────────────────
         sl_atr = entry - ATR_SL_MULT * atr
         tp_atr = entry + ATR_TP_MULT * atr
 
-        # Hard cap: SL never more than STOP_LOSS_PCT away from entry
+        # Hard SL cap
         sl_cap = entry * (1 - STOP_LOSS_PCT)
+
         sl     = round(max(sl_atr, sl_cap), 2)
         target = round(tp_atr, 2)
 
         risk   = entry - sl
         reward = target - entry
-        rr     = round(reward / risk, 3) if risk > 0 else 0.0
 
-        # ── Signal gate ───────────────────────────────────────
+        rr = round(reward / risk, 3) if risk > 0 else 0.0
+
+        # ─────────────────────────────────────────
+        # Entry quality filters
+        # ─────────────────────────────────────────
+        current_open  = float(df["open"].iloc[-1])
+        current_close = float(df["close"].iloc[-1])
+
+        prev_high = float(df["high"].iloc[-2])
+
+        # Candle body %
+        body_pct = abs(current_close - current_open) / current_open
+
+        # Breakout confirmation
+        breakout_ok = (
+            current_close > prev_high
+            and vol_ratio >= MIN_VOLUME_RATIO_CONFIRM
+        )
+
+        # Candle strength
+        body_ok = (
+            body_pct >= MIN_CANDLE_BODY_PCT
+        )
+
+        # ─────────────────────────────────────────
+        # Trend structure
+        # ─────────────────────────────────────────
+        ema20 = float(row["ema_20"])
+        ema50 = float(row["ema_50"])
+        vwap  = float(row["vwap"])
+
+        trend_ok = (
+            ema20 > ema50
+            and current_close > vwap
+        )
+
+        # ─────────────────────────────────────────
+        # Market regime filter
+        # ─────────────────────────────────────────
+        market_ok = (
+            row["nifty_above_ema20"] == 1
+            and row["nifty_trend"] == 1
+        )
+
+        # ─────────────────────────────────────────
+        # Volatility expansion
+        # ─────────────────────────────────────────
+        volatility_expansion = (
+            float(row["atr_ratio"]) > 1.1
+        )
+
+        # ─────────────────────────────────────────
+        # Avoid extended entries
+        # ─────────────────────────────────────────
+        distance_from_ema20 = float(
+            row["dist_from_ema20"]
+        )
+
+        not_extended = (
+            distance_from_ema20 <= MAX_DISTANCE_FROM_EMA20
+        )
+
+        # ─────────────────────────────────────────
+        # Avoid lunch-time chop
+        # ─────────────────────────────────────────
+        avoid_lunch = (
+            12 <= int(row["hour"]) <= 13
+        )
+
+        # ─────────────────────────────────────────
+        # Dynamic confidence threshold
+        # ─────────────────────────────────────────
+        dynamic_threshold = self.buy_threshold
+
+        market_strong = (
+            row["nifty_above_ema20"] == 1
+            and row["nifty_trend"] == 1
+            and float(row["atr_ratio"]) > 1.1
+        )
+
+        market_weak = (
+            row["nifty_above_ema20"] == 0
+            or row["nifty_trend"] == 0
+            or float(row["atr_ratio"]) < 1.0
+        )
+
+        # Aggressive during strong trends
+        if market_strong:
+            dynamic_threshold = 0.58
+
+        # Defensive during weak/choppy markets
+        elif market_weak:
+            dynamic_threshold = 0.70
+
+        # ─────────────────────────────────────────
+        # Signal gate
+        # ─────────────────────────────────────────
         signal = "HOLD"
         reason = ""
 
-        if prob_up < self.buy_threshold:
-            reason = f"prob_up={prob_up:.3f} < threshold={self.buy_threshold}"
+        if prob_up < dynamic_threshold:
+
+            reason = (
+                f"prob_up={prob_up:.3f} "
+                f"< threshold={dynamic_threshold:.2f}"
+            )
+
         elif rr < MIN_RR_RATIO:
-            reason = f"R:R={rr:.2f} < min={MIN_RR_RATIO}"
+
+            reason = (
+                f"R:R={rr:.2f} < min={MIN_RR_RATIO}"
+            )
+
         elif sl <= 0:
+
             reason = "sl<=0"
+
         elif target <= entry:
+
             reason = "target<=entry"
+
+        elif not breakout_ok:
+
+            reason = "breakout_not_confirmed"
+
+        elif not body_ok:
+
+            reason = (
+                f"weak_candle_body={body_pct:.4f}"
+            )
+
+        elif not trend_ok:
+
+            reason = "trend_filter_failed"
+
+        elif not market_ok:
+
+            reason = "market_regime_bad"
+
+        elif not volatility_expansion:
+
+            reason = "low_volatility_expansion"
+
+        elif not not_extended:
+
+            reason = (
+                f"too_far_from_ema20="
+                f"{distance_from_ema20:.4f}"
+            )
+
+        elif avoid_lunch:
+
+            reason = "lunch_hour_chop"
+
         else:
+
             signal = "BUY"
+
             self._weak_counts.pop(symbol, None)
 
+        # ─────────────────────────────────────────
+        # Debug logging
+        # ─────────────────────────────────────────
         log.debug(
-            "%s  prob=%.3f  signal=%s  entry=%.2f  SL=%.2f  TP=%.2f  R:R=%.2f  ATR=%.4f",
-            symbol, prob_up, signal, entry, sl, target, rr, atr,
+            "%s prob=%.3f signal=%s reason=%s "
+            "body=%.4f vol=%.2f trend=%s "
+            "market=%s vol_exp=%s "
+            "entry=%.2f SL=%.2f TP=%.2f "
+            "R:R=%.2f ATR=%.4f",
+
+            symbol,
+            prob_up,
+            signal,
+            reason,
+            body_pct,
+            vol_ratio,
+            trend_ok,
+            market_ok,
+            volatility_expansion,
+            entry,
+            sl,
+            target,
+            rr,
+            atr,
         )
 
+        # ─────────────────────────────────────────
+        # Final response
+        # ─────────────────────────────────────────
         return {
             "signal":  signal,
             "prob_up": round(prob_up, 4),
-            "entry":   round(entry,  2),
+            "entry":   round(entry, 2),
             "sl":      sl,
             "target":  target,
             "rr":      rr,
             "atr":     round(atr, 4),
-            "reason":  reason,
+            "atr_ratio": round(float(row["atr_ratio"]), 3),
+            "reason":  reason,          
         }
 
+    
     # ── Exit signal (signal flip / deterioration) ─────────────
     def should_exit(
         self, df: pd.DataFrame, side: str, symbol: str = "STOCK"
