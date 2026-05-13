@@ -30,7 +30,7 @@ import pandas as pd
 # ── Trade quality filters ─────────────────────────
 MIN_VOLUME_RATIO = 1.2     # avoid dead candles
 MIN_ATR_PCT      = 0.003   # avoid low volatility chop
-MODEL_THRESHOLD  = 0.60    # confidence threshold
+MODEL_THRESHOLD  = 0.55    # confidence threshold
 
 
 from data.features import build_features, FEATURE_COLS
@@ -55,6 +55,13 @@ from config.config import (
     MIN_VOLUME_RATIO_CONFIRM,
     MIN_CANDLE_BODY_PCT,
     MAX_DISTANCE_FROM_EMA20,
+    MIN_VOLUME_RATIO,
+    MIN_ATR_PCT,
+    REQUIRE_BREAKOUT_CONFIRMATION,
+    REQUIRE_VWAP_CONFIRM,
+    TREND_STRENGTH_ENABLED,
+    MAX_DISTANCE_FROM_VWAP,
+    AVOID_LUNCH_HOURS,
 )
 
 log = logging.getLogger("signal_engine")
@@ -142,36 +149,19 @@ class SignalEngine:
 
     # ── Core scoring ──────────────────────────────────────────
     def score(self, df: pd.DataFrame, symbol: str = "STOCK") -> dict:
-        """
-        Score the latest candle and return a signal dict.
 
-        Entry / SL / Target are computed with ATR-based volatility logic.
-
-        Returns:
-            {
-                "signal":  "BUY" | "HOLD",
-                "prob_up": float,
-                "entry":   float,
-                "sl":      float,
-                "target":  float,
-                "rr":      float,
-                "atr":     float,
-                "reason":  str,
-            }
-        """
-
-        # ─────────────────────────────────────────
-        # Basic validation
-        # ─────────────────────────────────────────
+        # =========================================================
+        # BASIC VALIDATION
+        # =========================================================
         if symbol.upper() in BLOCKED_SYMBOLS:
             return {**_NULL_RESULT, "reason": "blocked_symbol"}
 
         if df is None or df.empty or len(df) < 50:
             return {**_NULL_RESULT, "reason": "insufficient_data"}
 
-        # ─────────────────────────────────────────
-        # Feature generation
-        # ─────────────────────────────────────────
+        # =========================================================
+        # FEATURE GENERATION
+        # =========================================================
         try:
             feat = build_features(
                 df.copy(),
@@ -180,7 +170,12 @@ class SignalEngine:
             )
 
         except Exception as e:
-            log.warning("%s: build_features failed: %s", symbol, e)
+
+            log.warning(
+                "%s: build_features failed: %s",
+                symbol,
+                e
+            )
 
             return {
                 **_NULL_RESULT,
@@ -188,32 +183,50 @@ class SignalEngine:
             }
 
         if feat.empty:
-            return {**_NULL_RESULT, "reason": "empty_features"}
+            return {
+                **_NULL_RESULT,
+                "reason": "empty_features"
+            }
 
         row = feat.iloc[-1]
 
-        missing = [c for c in FEATURE_COLS if c not in feat.columns]
+        missing = [
+            c for c in FEATURE_COLS
+            if c not in feat.columns
+        ]
 
         if missing:
-            log.warning("%s: missing features: %s", symbol, missing[:5])
+
+            log.warning(
+                "%s: missing features: %s",
+                symbol,
+                missing[:5]
+            )
 
             return {
                 **_NULL_RESULT,
                 "reason": "missing_features"
             }
 
-        # ─────────────────────────────────────────
-        # Model prediction
-        # ─────────────────────────────────────────
-        X_raw = row[FEATURE_COLS].values.reshape(1, -1).astype(np.float32)
+        # =========================================================
+        # MODEL PREDICTION
+        # =========================================================
+        X_raw = (
+            row[FEATURE_COLS]
+            .values
+            .reshape(1, -1)
+            .astype(np.float32)
+        )
 
         if np.isnan(X_raw).any():
+
             return {
                 **_NULL_RESULT,
                 "reason": "nan_in_features"
             }
 
         try:
+
             X_scaled = self.scaler.transform(X_raw)
 
             prob_up = float(
@@ -221,20 +234,24 @@ class SignalEngine:
             )
 
         except Exception as e:
-            log.warning("%s: model predict failed: %s", symbol, e)
+
+            log.warning(
+                "%s: model predict failed: %s",
+                symbol,
+                e
+            )
 
             return {
                 **_NULL_RESULT,
                 "reason": f"predict_error:{e}"
             }
 
-        # ─────────────────────────────────────────
-        # Trade quality filters
-        # ─────────────────────────────────────────
+        # =========================================================
+        # BASIC FILTERS
+        # =========================================================
         vol_ratio = float(row.get("vol_ratio", 0.0))
         atr_pct   = float(row.get("atr_pct", 0.0))
 
-        # Volume filter
         if vol_ratio < MIN_VOLUME_RATIO:
 
             return {
@@ -243,7 +260,6 @@ class SignalEngine:
                 "reason": f"low_volume:{vol_ratio:.2f}",
             }
 
-        # Volatility filter
         if atr_pct < MIN_ATR_PCT:
 
             return {
@@ -252,18 +268,9 @@ class SignalEngine:
                 "reason": f"low_atr:{atr_pct:.4f}",
             }
 
-        # ML confidence filter
-        if prob_up < MODEL_THRESHOLD:
-
-            return {
-                **_NULL_RESULT,
-                "prob_up": round(prob_up, 4),
-                "reason": f"low_confidence:{prob_up:.3f}",
-            }
-
-        # ─────────────────────────────────────────
-        # Price + ATR
-        # ─────────────────────────────────────────
+        # =========================================================
+        # PRICE + ATR
+        # =========================================================
         entry = float(row.get("close", 0.0))
         atr   = float(row.get("atr_14", 0.0))
 
@@ -275,13 +282,12 @@ class SignalEngine:
                 "reason": "invalid_atr_or_price"
             }
 
-        # ─────────────────────────────────────────
-        # ATR-based SL / Target
-        # ─────────────────────────────────────────
+        # =========================================================
+        # SL / TARGET
+        # =========================================================
         sl_atr = entry - ATR_SL_MULT * atr
         tp_atr = entry + ATR_TP_MULT * atr
 
-        # Hard SL cap
         sl_cap = entry * (1 - STOP_LOSS_PCT)
 
         sl     = round(max(sl_atr, sl_cap), 2)
@@ -292,31 +298,30 @@ class SignalEngine:
 
         rr = round(reward / risk, 3) if risk > 0 else 0.0
 
-        # ─────────────────────────────────────────
-        # Entry quality filters
-        # ─────────────────────────────────────────
+        # =========================================================
+        # ENTRY QUALITY
+        # =========================================================
         current_open  = float(df["open"].iloc[-1])
         current_close = float(df["close"].iloc[-1])
 
         prev_high = float(df["high"].iloc[-2])
 
-        # Candle body %
-        body_pct = abs(current_close - current_open) / current_open
+        body_pct = abs(
+            current_close - current_open
+        ) / current_open
 
-        # Breakout confirmation
         breakout_ok = (
             current_close > prev_high
             and vol_ratio >= MIN_VOLUME_RATIO_CONFIRM
         )
 
-        # Candle strength
         body_ok = (
             body_pct >= MIN_CANDLE_BODY_PCT
         )
 
-        # ─────────────────────────────────────────
-        # Trend structure
-        # ─────────────────────────────────────────
+        # =========================================================
+        # TREND STRUCTURE
+        # =========================================================
         ema20 = float(row["ema_20"])
         ema50 = float(row["ema_50"])
         vwap  = float(row["vwap"])
@@ -326,133 +331,126 @@ class SignalEngine:
             and current_close > vwap
         )
 
-        # ─────────────────────────────────────────
-        # Market regime filter
-        # ─────────────────────────────────────────
+        # =========================================================
+        # MARKET REGIME
+        # =========================================================
         market_ok = (
             row["nifty_above_ema20"] == 1
-            and row["nifty_trend"] == 1
+            and row["nifty_trend"] > 0
         )
 
-        # ─────────────────────────────────────────
-        # Volatility expansion
-        # ─────────────────────────────────────────
+        # =========================================================
+        # VOLATILITY EXPANSION
+        # =========================================================
         volatility_expansion = (
             float(row["atr_ratio"]) > 1.1
         )
 
-        # ─────────────────────────────────────────
-        # Avoid extended entries
-        # ─────────────────────────────────────────
+        # =========================================================
+        # EXTENSION FILTER
+        # =========================================================
         distance_from_ema20 = float(
             row["dist_from_ema20"]
+        )
+
+        dist_from_vwap = float(
+            row["dist_from_vwap"]
         )
 
         not_extended = (
             distance_from_ema20 <= MAX_DISTANCE_FROM_EMA20
         )
 
-        # ─────────────────────────────────────────
-        # Avoid lunch-time chop
-        # ─────────────────────────────────────────
+        # =========================================================
+        # LUNCH FILTER
+        # =========================================================
         avoid_lunch = (
-            12 <= int(row["hour"]) <= 13
+            AVOID_LUNCH_HOURS
+            and 12 <= int(row["hour"]) <= 13
         )
 
-        # ─────────────────────────────────────────
-        # Dynamic confidence threshold
-        # ─────────────────────────────────────────
+        # =========================================================
+        # DYNAMIC THRESHOLD
+        # =========================================================
         dynamic_threshold = self.buy_threshold
 
         market_strong = (
             row["nifty_above_ema20"] == 1
-            and row["nifty_trend"] == 1
+            and row["nifty_trend"] > 0
             and float(row["atr_ratio"]) > 1.1
         )
 
         market_weak = (
             row["nifty_above_ema20"] == 0
-            or row["nifty_trend"] == 0
+            or row["nifty_trend"] <= 0
             or float(row["atr_ratio"]) < 1.0
         )
 
-        # Aggressive during strong trends
         if market_strong:
             dynamic_threshold = 0.58
 
-        # Defensive during weak/choppy markets
         elif market_weak:
             dynamic_threshold = 0.70
 
-        # ─────────────────────────────────────────
-        # Signal gate
-        # ─────────────────────────────────────────
-        signal = "HOLD"
-        reason = ""
+        # =========================================================
+        # REJECTION DEBUG ENGINE
+        # =========================================================
+        reject_reason = []
 
         if prob_up < dynamic_threshold:
+            reject_reason.append("low_prob")
 
-            reason = (
-                f"prob_up={prob_up:.3f} "
-                f"< threshold={dynamic_threshold:.2f}"
+        if rr < MIN_RR_RATIO:
+            reject_reason.append("low_rr")
+
+        if vol_ratio < MIN_VOLUME_RATIO_CONFIRM:
+            reject_reason.append("low_volume")
+
+        if REQUIRE_BREAKOUT_CONFIRMATION and not breakout_ok:
+            reject_reason.append("no_breakout")
+
+        if REQUIRE_VWAP_CONFIRM and current_close < vwap:
+            reject_reason.append("below_vwap")
+
+        if TREND_STRENGTH_ENABLED and not trend_ok:
+            reject_reason.append("weak_trend")
+
+        if dist_from_vwap > MAX_DISTANCE_FROM_VWAP:
+            reject_reason.append("overextended")
+
+        if not volatility_expansion:
+            reject_reason.append("low_volatility")
+
+        if avoid_lunch:
+            reject_reason.append("lunch_chop")
+
+        # =========================================================
+        # FINAL SIGNAL
+        # =========================================================
+        signal = "HOLD"
+
+        if reject_reason:
+
+            reason = ",".join(reject_reason)
+
+            log.info(
+                "%s rejected: %s | prob=%.3f rr=%.2f",
+                symbol,
+                reason,
+                prob_up,
+                rr,
             )
-
-        elif rr < MIN_RR_RATIO:
-
-            reason = (
-                f"R:R={rr:.2f} < min={MIN_RR_RATIO}"
-            )
-
-        elif sl <= 0:
-
-            reason = "sl<=0"
-
-        elif target <= entry:
-
-            reason = "target<=entry"
-
-        elif not breakout_ok:
-
-            reason = "breakout_not_confirmed"
-
-        elif not body_ok:
-
-            reason = (
-                f"weak_candle_body={body_pct:.4f}"
-            )
-
-        elif not trend_ok:
-
-            reason = "trend_filter_failed"
-
-        elif not market_ok:
-
-            reason = "market_regime_bad"
-
-        elif not volatility_expansion:
-
-            reason = "low_volatility_expansion"
-
-        elif not not_extended:
-
-            reason = (
-                f"too_far_from_ema20="
-                f"{distance_from_ema20:.4f}"
-            )
-
-        elif avoid_lunch:
-
-            reason = "lunch_hour_chop"
 
         else:
 
             signal = "BUY"
+            reason = "passed"
 
             self._weak_counts.pop(symbol, None)
 
-        # ─────────────────────────────────────────
-        # Debug logging
-        # ─────────────────────────────────────────
+        # =========================================================
+        # DEBUG LOG
+        # =========================================================
         log.debug(
             "%s prob=%.3f signal=%s reason=%s "
             "body=%.4f vol=%.2f trend=%s "
@@ -476,21 +474,20 @@ class SignalEngine:
             atr,
         )
 
-        # ─────────────────────────────────────────
-        # Final response
-        # ─────────────────────────────────────────
+        # =========================================================
+        # FINAL RESPONSE
+        # =========================================================
         return {
-            "signal":  signal,
+            "signal": signal,
             "prob_up": round(prob_up, 4),
-            "entry":   round(entry, 2),
-            "sl":      sl,
-            "target":  target,
-            "rr":      rr,
-            "atr":     round(atr, 4),
+            "entry": round(entry, 2),
+            "sl": sl,
+            "target": target,
+            "rr": rr,
+            "atr": round(atr, 4),
             "atr_ratio": round(float(row["atr_ratio"]), 3),
-            "reason":  reason,          
+            "reason": reason,
         }
-
     
     # ── Exit signal (signal flip / deterioration) ─────────────
     def should_exit(

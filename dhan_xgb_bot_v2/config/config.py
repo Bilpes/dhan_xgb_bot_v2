@@ -34,7 +34,7 @@ MAX_PER_SECTOR       = 1
 NO_NEW_TRADE_BEFORE  = "09:30"   # wait 15 min for market to settle
 ALLOW_SHORTS         = False
 # ── XGBoost signal thresholds ───────────────────────────────
-BUY_THRESHOLD        = 0.75
+BUY_THRESHOLD        = 0.65
 SELL_THRESHOLD       = 0.38
 
 # ── Stop-loss settings ──────────────────────────────────────
@@ -60,7 +60,7 @@ MIN_ATR_PCT       = 0.003
 # ── Entry quality filters ─────────────────────────────
 REQUIRE_BREAKOUT_CONFIRMATION = True
 
-MIN_VOLUME_RATIO_CONFIRM = 1.5
+MIN_VOLUME_RATIO_CONFIRM = 1.3
 MIN_CANDLE_BODY_PCT      = 0.003
 MAX_DISTANCE_FROM_EMA20  = 0.025
 

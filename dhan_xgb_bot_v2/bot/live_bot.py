@@ -904,6 +904,7 @@ class LiveBot:
         Candle-boundary checks (signal flip, candle-low SL) run only
         at 5-min close to avoid acting on intra-candle noise.
         """
+
         if not self.trades:
             return
 
@@ -911,25 +912,38 @@ class LiveBot:
         prices = self.broker.get_ltp_batch(id_map)
 
         for symbol, trade in list(self.trades.items()):
+
             ltp = prices.get(str(trade.security_id), 0.0)
+
             if ltp <= 0:
                 log.warning("%s: LTP unavailable — skip tick.", symbol)
                 continue
 
-            trade.candles_held += 1
-
+            # ── Update running high ──────────────────────────
             if ltp > trade.running_high:
                 trade.running_high = ltp
 
-            pnl         = trade.unrealised_pnl(ltp)
-            profit_pct  = (ltp - trade.entry) / trade.entry
-            hold_mins   = trade.hold_minutes()
+            pnl        = trade.unrealised_pnl(ltp)
+            profit_pct = (ltp - trade.entry) / trade.entry
+            hold_mins  = trade.hold_minutes()
 
-            # ── 1. Target hit ─────────────────────────────────
+            # ── 1. Target hit ────────────────────────────────
             if ltp >= trade.target:
-                log.info("%s: TARGET HIT ltp=%.2f TP=%.2f held=%.0fmin",
-                         symbol, ltp, trade.target, hold_mins)
-                self._exit_trade(trade, ltp, "TARGET_HIT")
+
+                log.info(
+                    "%s: TARGET HIT ltp=%.2f TP=%.2f held=%.0fmin",
+                    symbol,
+                    ltp,
+                    trade.target,
+                    hold_mins,
+                )
+
+                self._exit_trade(
+                    trade,
+                    ltp,
+                    "TARGET_HIT"
+                )
+
                 continue
 
             # ── 2. Adaptive trailing stop ───────────────────
@@ -970,75 +984,203 @@ class LiveBot:
                     trade.stop_loss,
                     ltp,
                     pnl,
-                ) 
+                )
 
-            # ── 3. LTP SL check ───────────────────────────────
+            # ── 3. LTP SL check ─────────────────────────────
             if ltp <= trade.stop_loss:
-                log.warning("%s: SL HIT (LTP) ltp=%.2f SL=%.2f held=%.0fmin",
-                            symbol, ltp, trade.stop_loss, hold_mins)
-                self._exit_trade(trade, ltp, "SL_HIT")
+
+                log.warning(
+                    "%s: SL HIT (LTP) ltp=%.2f SL=%.2f held=%.0fmin",
+                    symbol,
+                    ltp,
+                    trade.stop_loss,
+                    hold_mins,
+                )
+
+                self._exit_trade(
+                    trade,
+                    ltp,
+                    "SL_HIT"
+                )
+
                 self.sl_blacklist.add(symbol)
+
                 continue
 
-            # ── Candle-boundary checks ────────────────────────
+            # ── Candle-boundary checks ──────────────────────
             if _is_candle_boundary():
 
-                # ── 4. Candle-low SL check ────────────────────
-                # NSE Level-2 data shows wicks often breach SL intra-candle.
-                # Checking candle low catches these wick-hits accurately.
-                try:
-                    df_check = self.broker.get_candles(
-                        trade.security_id, symbol, days_back=1)
-                    if not df_check.empty:
-                        last_low = float(df_check["low"].iloc[-1])
-                        if last_low <= trade.stop_loss:
-                            log.warning(
-                                "%s: SL HIT (candle low) low=%.2f ≤ SL=%.2f held=%.0fmin",
-                                symbol, last_low, trade.stop_loss, hold_mins,
-                            )
-                            self._exit_trade(trade, trade.stop_loss, "SL_HIT_CANDLE_LOW")
-                            self.sl_blacklist.add(symbol)
-                            continue
-                except Exception as e:
-                    log.warning("%s: candle-low SL check error: %s", symbol, e)
+                # ── New candle completed ────────────────────
+                trade.candles_held += 1
 
-                # ── 5. Auto-exit: 2:45 PM weak market ────────
-                if _is_auto_exit_time() and profit_pct <= AUTO_EXIT_THRESHOLD:
+                # ── Momentum failure exit ───────────────────
+                # Good breakout trades should work quickly.
+                # If still negative after 3 completed candles,
+                # continuation probability drops sharply.
+
+                if (
+                    trade.candles_held >= 3
+                    and pnl < 0
+                ):
+
                     log.warning(
-                        "%s: AUTO-EXIT 2:45 PM — profit %.2f%% ≤ threshold %.2f%%",
-                        symbol, profit_pct * 100, AUTO_EXIT_THRESHOLD * 100,
+                        "%s: MOMENTUM FAILURE EXIT "
+                        "candles=%d pnl=₹%.0f",
+                        symbol,
+                        trade.candles_held,
+                        pnl,
                     )
-                    self._exit_trade(trade, ltp, "AUTO_EXIT_EOD_WEAK")
+
+                    self._exit_trade(
+                        trade,
+                        ltp,
+                        "MOMENTUM_FAILURE"
+                    )
+
                     continue
 
-                # ── 6. Signal flip / model deterioration ──────
+                # ── 4. Candle-low SL check ─────────────────
+                # NSE Level-2 data shows wicks often breach SL intra-candle.
+                # Checking candle low catches wick-hits accurately.
+
                 try:
-                    df_live = self.broker.get_candles(
-                        trade.security_id, symbol, days_back=5)
-                    if not df_live.empty:
-                        scored = self.engine.score(df_live, symbol=symbol)
-                        trade.last_prob = scored["prob_up"]
-                        if self.engine.should_exit(df_live, trade.side, symbol=symbol):
-                            log.info(
-                                "%s: SIGNAL FLIP exit=%.2f prob=%.3f P&L=₹%.0f held=%.0fmin",
-                                symbol, ltp, scored["prob_up"], pnl, hold_mins,
+
+                    df_check = self.broker.get_candles(
+                        trade.security_id,
+                        symbol,
+                        days_back=1,
+                    )
+
+                    if not df_check.empty:
+
+                        last_low = float(df_check["low"].iloc[-1])
+
+                        if last_low <= trade.stop_loss:
+
+                            log.warning(
+                                "%s: SL HIT (candle low) "
+                                "low=%.2f ≤ SL=%.2f held=%.0fmin",
+                                symbol,
+                                last_low,
+                                trade.stop_loss,
+                                hold_mins,
                             )
-                            self._exit_trade(trade, ltp, "SIGNAL_FLIP")
+
+                            self._exit_trade(
+                                trade,
+                                trade.stop_loss,
+                                "SL_HIT_CANDLE_LOW"
+                            )
+
+                            self.sl_blacklist.add(symbol)
+
                             continue
+
                 except Exception as e:
-                    log.warning("%s: signal flip check error: %s", symbol, e)
 
-            # ── Holding log ───────────────────────────────────
+                    log.warning(
+                        "%s: candle-low SL check error: %s",
+                        symbol,
+                        e,
+                    )
+
+                # ── 5. Auto-exit: 2:45 PM weak market ─────
+                if (
+                    _is_auto_exit_time()
+                    and profit_pct <= AUTO_EXIT_THRESHOLD
+                ):
+
+                    log.warning(
+                        "%s: AUTO-EXIT 2:45 PM "
+                        "profit %.2f%% ≤ threshold %.2f%%",
+                        symbol,
+                        profit_pct * 100,
+                        AUTO_EXIT_THRESHOLD * 100,
+                    )
+
+                    self._exit_trade(
+                        trade,
+                        ltp,
+                        "AUTO_EXIT_EOD_WEAK"
+                    )
+
+                    continue
+
+                # ── 6. Signal flip / model deterioration ──
+                try:
+
+                    df_live = self.broker.get_candles(
+                        trade.security_id,
+                        symbol,
+                        days_back=5,
+                    )
+
+                    if not df_live.empty:
+
+                        scored = self.engine.score(
+                            df_live,
+                            symbol=symbol,
+                        )
+
+                        trade.last_prob = scored["prob_up"]
+
+                        if self.engine.should_exit(
+                            df_live,
+                            trade.side,
+                            symbol=symbol,
+                        ):
+
+                            log.info(
+                                "%s: SIGNAL FLIP "
+                                "exit=%.2f prob=%.3f "
+                                "P&L=₹%.0f held=%.0fmin "
+                                "candles=%d",
+                                symbol,
+                                ltp,
+                                scored["prob_up"],
+                                pnl,
+                                hold_mins,
+                                trade.candles_held,
+                            )
+
+                            self._exit_trade(
+                                trade,
+                                ltp,
+                                "SIGNAL_FLIP"
+                            )
+
+                            continue
+
+                except Exception as e:
+
+                    log.warning(
+                        "%s: signal flip check error: %s",
+                        symbol,
+                        e,
+                    )
+
+            # ── Holding log ───────────────────────────────
             log.info(
-                "HOLD %-14s LTP=%.2f  Entry=%.2f  SL=%.2f  TP=%.2f"
-                "  ATR=%.2f  prob=%.3f  R:R=%.2fx  P&L=₹%+.0f"
-                "  pct=%+.2f%%  held=%.0fm  [%s]",
-                symbol, ltp, trade.entry, trade.stop_loss, trade.target,
-                trade.atr, trade.last_prob, trade.rr, pnl,
-                profit_pct * 100, hold_mins,
-                SECTOR_MAP.get(symbol, "?"),
-            )
+                "HOLD %-14s LTP=%.2f  Entry=%.2f  "
+                "SL=%.2f  TP=%.2f  ATR=%.2f  "
+                "prob=%.3f  R:R=%.2fx  "
+                "P&L=₹%+.0f  pct=%+.2f%%  "
+                "held=%.0fm  [%s] held_candles=%d",
 
+                symbol,
+                ltp,
+                trade.entry,
+                trade.stop_loss,
+                trade.target,
+                trade.atr,
+                trade.last_prob,
+                trade.rr,
+                pnl,
+                profit_pct * 100,
+                hold_mins,
+                SECTOR_MAP.get(symbol, "?"),
+                trade.candles_held,
+            )
     # ──────────────────────────────────────────────────────────
     #  Force exit all (EOD / circuit breaker)
     # ──────────────────────────────────────────────────────────

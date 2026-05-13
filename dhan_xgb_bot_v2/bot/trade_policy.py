@@ -9,27 +9,76 @@
 # ── Label generation (auto_retrain.py uses these) ───────────
 # bot/trade_policy.py — REPLACE the ATR label section with this:
 
-# ── Label design (percentage-based — train/live consistent) ──
-TP_PCT   = 0.025    # 2.5% TP  — HDFCBANK ₹780 → must reach ₹799.50
-SL_PCT   = 0.010    # 1.0% SL  — HDFCBANK ₹780 → stop at ₹772.20
-HORIZON  = 24       # max 24 candles (2 hours) to hit TP — realistic window
+# ─────────────────────────────────────────────────────────────
+# Label design (train-time targets)
+# ─────────────────────────────────────────────────────────────
+# Goal:
+# Train model to predict strong intraday momentum continuation.
+# Labels are percentage-based for train/live consistency.
 
-# ── ATR still used for LIVE SL/TP (not labels) ───────────────
-ATR_SL_MULT = 1.5   # live trade SL (SignalEngine uses this)
-ATR_TP_MULT = 3.0   # live trade TP (SignalEngine uses this)
+TP_PCT   = 0.025    # 2.5% target
+SL_PCT   = 0.010    # 1.0% stop
+HORIZON  = 24       # 24 x 5m candles ≈ 2 trading hours
+
+
+# ─────────────────────────────────────────────────────────────
+# LIVE trade execution settings
+# ─────────────────────────────────────────────────────────────
+# ATR adapts to volatility dynamically.
+# Used only during live execution, NOT label generation.
+
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 3.0
 ATR_PERIOD  = 14
 
-# ── Signal engine thresholds ────────────────────────────────
-BUY_THRESHOLD_DEFAULT  = 0.65   # minimum prob_up to fire BUY
-MIN_RR_RATIO           = 1.8    # R:R gate
 
-# ── Exit / deterioration thresholds ─────────────────────────
-EXIT_LONG_THRESHOLD    = 0.42   # hard exit if prob_up drops below this
-EXIT_SHORT_THRESHOLD   = 0.58   # hard exit for short
-WEAK_THRESHOLD         = 0.52   # "weakening" zone — starts candle counter
-WEAK_CANDLES_MAX       = 3      # exit after N consecutive weak candles
+# ─────────────────────────────────────────────────────────────
+# Entry filters
+# ─────────────────────────────────────────────────────────────
 
-# ── Blocked symbols ──────────────────────────────────────────
+BUY_THRESHOLD_DEFAULT = 0.65
+
+# Minimum reward:risk required
+MIN_RR_RATIO = 2.0
+
+
+# ─────────────────────────────────────────────────────────────
+# Exit / deterioration logic
+# ─────────────────────────────────────────────────────────────
+
+# Hard probability exits
+EXIT_LONG_THRESHOLD  = 0.42
+EXIT_SHORT_THRESHOLD = 0.58
+
+# Weakening regime
+WEAK_THRESHOLD    = 0.52
+WEAK_CANDLES_MAX  = 3
+
+# Momentum failure exit
+# Good trades should work quickly.
+# Exit if still negative after N completed candles.
+
+MOMENTUM_EXIT_CANDLES = 3
+
+
+# ─────────────────────────────────────────────────────────────
+# Risk controls
+# ─────────────────────────────────────────────────────────────
+
+# Maximum open trades simultaneously
+MAX_OPEN_POSITIONS = 5
+
+# Daily circuit breaker
+MAX_DAILY_LOSS_PCT = 0.03     # stop trading after -3%
+
+# Consecutive SL protection
+MAX_CONSECUTIVE_LOSSES = 4
+
+
+# ─────────────────────────────────────────────────────────────
+# Blocked symbols
+# ─────────────────────────────────────────────────────────────
+
 BLOCKED_SYMBOLS = {
     "ADANIENT",
     "ADANIPORTS",

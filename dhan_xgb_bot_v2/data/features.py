@@ -524,7 +524,7 @@ FEATURE_COLS = [
     "price_vs_ema21",
     "price_vs_ema50",
 
-    "ema_50",
+    #"ema_50",
 
     "trend_strength",
     "is_trending",
