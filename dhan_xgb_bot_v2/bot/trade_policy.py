@@ -16,8 +16,8 @@
 # Train model to predict strong intraday momentum continuation.
 # Labels are percentage-based for train/live consistency.
 
-TP_PCT   = 0.025    # 2.5% target
-SL_PCT   = 0.010    # 1.0% stop
+#TP_PCT   = 0.025    # 2.5% target
+#SL_PCT   = 0.010    # 1.0% stop
 HORIZON  = 24       # 24 x 5m candles ≈ 2 trading hours
 
 
@@ -47,18 +47,18 @@ MIN_RR_RATIO = 2.0
 # ─────────────────────────────────────────────────────────────
 
 # Hard probability exits
-EXIT_LONG_THRESHOLD  = 0.42
-EXIT_SHORT_THRESHOLD = 0.58
+EXIT_LONG_THRESHOLD  = 0.56
+EXIT_SHORT_THRESHOLD = 0.60
 
 # Weakening regime
-WEAK_THRESHOLD    = 0.52
+WEAK_THRESHOLD    = 0.64            
 WEAK_CANDLES_MAX  = 3
 
 # Momentum failure exit
 # Good trades should work quickly.
 # Exit if still negative after N completed candles.
 
-MOMENTUM_EXIT_CANDLES = 3
+MOMENTUM_EXIT_CANDLES = 6
 
 
 # ─────────────────────────────────────────────────────────────
@@ -74,7 +74,15 @@ MAX_DAILY_LOSS_PCT = 0.03     # stop trading after -3%
 # Consecutive SL protection
 MAX_CONSECUTIVE_LOSSES = 4
 
+# ─────────────────────────────────────────────────────────────
+# Volatility-adjusted position sizing
+# ─────────────────────────────────────────────────────────────
 
+# Reduce size in highly volatile stocks
+MAX_ATR_RISK_MULTIPLIER = 0.015
+
+# Never reduce below 35% normal size
+MIN_POSITION_SCALE = 0.35
 # ─────────────────────────────────────────────────────────────
 # Blocked symbols
 # ─────────────────────────────────────────────────────────────

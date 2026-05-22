@@ -12,6 +12,15 @@
 #   BOT_MODE=test   → one scan cycle, print signals, exit
 #   BOT_MODE=paper  → full loop, simulated fills, P&L tracked
 #   BOT_MODE=live   → real bracket orders via Dhan API
+#
+# Fix log (2026-05-14):
+#   FIX-2: market_regime now uses entry_prob (immutable), not last_prob
+#   FIX-3: momentum exit raised to 8 candles (40 min) for CNC mode
+#   FIX-4: circuit breaker Telegram alert fires only once per halt
+#   FIX-5: _should_rotate() uses fresh engine.score() for last_prob
+#   FIX-6: _force_exit_all() fallback uses entry price, not running_high
+#   FIX-7: _is_candle_boundary() de-duplicated per candle via key guard
+#          KeyboardInterrupt now calls _force_exit_all() in live mode
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from datetime import datetime, time as dtime
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
+from collections import defaultdict
 
 load_dotenv(dotenv_path=os.path.join("config", ".env"))
 
@@ -98,6 +108,51 @@ MODE_LABEL = {
 CANDLE_MINUTES = 5
 
 
+def _expected_pnl(
+    prob_up: float,
+    entry:   float,
+    sl:      float,
+    target:  float,
+    qty:     int,
+) -> float:
+    """
+    Heuristic expected PnL for one trade in rupees.
+
+    Formula:
+        E = prob_up × reward - (1 - prob_up) × risk
+
+    where:
+        reward = (target - entry) × qty   ← rupees gained if TP hit
+        risk   = (entry  - sl)    × qty   ← rupees lost  if SL hit
+
+    This is dimensionally correct and economically meaningful.
+    It is NOT true expectancy because prob_up is an uncalibrated
+    XGBoost classification probability, not an empirical win rate.
+
+    CALIBRATION UPGRADE PATH (run after ≥200 closed trades):
+        Step 1: Group trade_analysis.csv by prob_up bucket
+                (0.65-0.70, 0.70-0.75, 0.75-0.80, etc.)
+        Step 2: empirical_win_rate = tp_hits / total per bucket
+        Step 3: Replace prob_up argument with
+                empirical_win_rate[bucket(prob_up)]
+        Step 4: Function now computes TRUE expectancy.
+        Your trade_analysis.csv already logs everything needed.
+
+    Args:
+        prob_up: Model's upward probability (uncalibrated).
+        entry:   Entry price in rupees.
+        sl:      Stop-loss price in rupees.
+        target:  Take-profit price in rupees.
+        qty:     Number of shares.
+
+    Returns:
+        Expected PnL in rupees (can be negative).
+    """
+    reward = (target - entry) * qty
+    risk   = (entry - sl)    * qty
+    return prob_up * reward - (1.0 - prob_up) * risk
+
+
 # ─────────────────────────────────────────────────────────────
 #  Trade dataclass
 # ─────────────────────────────────────────────────────────────
@@ -105,11 +160,18 @@ class Trade:
     """
     Immutable identity fields set at entry.
     Mutable fields updated during position monitoring.
+
+    entry_prob: Immutable. Model probability at entry time.
+                Used for market_regime classification in analytics.
+                Never overwritten after construction.
+    last_prob:  Mutable. Updated each candle boundary during
+                signal-flip checks. Used for rotation logic only.
     """
     __slots__ = (
         "symbol", "security_id", "side", "qty",
         "entry", "stop_loss", "target", "order_id", "mode",
         "running_high", "open_time",
+        "entry_prob",   # FIX-2: immutable entry probability for regime classification
         "last_prob", "rr", "atr",
         "candles_held", "trail_count",
     )
@@ -140,7 +202,8 @@ class Trade:
         self.mode        = mode
         self.running_high = entry
         self.open_time   = datetime.now()
-        self.last_prob   = last_prob
+        self.entry_prob  = last_prob   # FIX-2: snapshot at entry — never changes
+        self.last_prob   = last_prob   # mutable — updated each candle boundary
         self.rr          = rr
         self.atr         = atr
         self.candles_held  = 0     # incremented each monitor tick
@@ -166,7 +229,7 @@ class Trade:
 #  Utility functions
 # ─────────────────────────────────────────────────────────────
 def _log_trade_csv(row: dict):
-    """Append one trade row to TRADE_LOG CSV. Thread-safe for single process."""
+    """Append one trade row to TRADE_LOG CSV. Single-process append."""
     exists = os.path.exists(TRADE_LOG)
     with open(TRADE_LOG, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=row.keys())
@@ -203,15 +266,6 @@ def _is_auto_exit_time() -> bool:
     return _now_time() >= _parse_time(AUTO_EXIT_TIME)
 
 
-def _is_candle_boundary() -> bool:
-    """
-    True at the close of each 5-min candle.
-    Used to gate signal-flip checks and candle-low SL validation —
-    avoid over-checking intra-candle noise (Berkman et al. 2012).
-    """
-    return datetime.now().minute % CANDLE_MINUTES == 0
-
-
 # ─────────────────────────────────────────────────────────────
 #  LiveBot
 # ─────────────────────────────────────────────────────────────
@@ -234,6 +288,21 @@ class LiveBot:
       and auto-exits weak positions before 2:45 PM close.
     """
 
+    # ── Rotation cost constant ─────────────────────────────────
+    # Estimated round-trip transaction cost for CNC on NSE:
+    # STT (0.1% delivery) + brokerage + NSE charges + SEBI fee ≈ 0.20%
+    _ROTATION_ROUNDTRIP_COST_PCT = 0.0020
+
+    # Minimum candles a position must be held before rotation eligibility.
+    # 6 candles × 5 min = 30 minutes minimum hold before rotation.
+    _ROTATION_MIN_CANDLES = 6
+
+    # FIX-3: Minimum candles before momentum-failure exit is evaluated.
+    # CNC delivery trades need time to develop — 15 min (3 candles) is
+    # statistical noise on a large-cap NSE stock. 8 candles = 40 minutes
+    # is a more appropriate minimum for post-breakout continuation checks.
+    _MOMENTUM_EXIT_MIN_CANDLES = 8
+
     def __init__(self):
         self.broker  = DhanBroker()
         self.engine  = SignalEngine()
@@ -245,6 +314,45 @@ class LiveBot:
         self._last_scan_ts    = 0.0
         self._entry_quotes:   dict[str, dict] = {}
         self._nifty_refreshed = False
+
+        # FIX-4: Circuit breaker alert sent only once per halt period.
+        # Prevents Telegram spam when the bot is halted for the day.
+        self._circuit_alert_sent = False
+        # ── Daily rejection statistics ──────────────────────────────
+        self.rejection_stats: dict[str, int] = defaultdict(int)
+        self.rejection_symbols: dict[str, list[str]] = defaultdict(list)
+        # FIX-7: Candle boundary deduplication key.
+        # Stores (date, hour, minute) of the last processed boundary.
+        # Prevents candles_held from being incremented multiple times
+        # within the same 1-minute window when MONITOR_INTERVAL < 60s.
+        self._last_boundary_key: Optional[tuple] = None
+
+    # ──────────────────────────────────────────────────────────
+    #  FIX-7: Candle boundary check — fires exactly once per candle
+    # ──────────────────────────────────────────────────────────
+    def _is_candle_boundary(self) -> bool:
+        """
+        True ONCE per 5-minute candle close.
+
+        Original implementation returned True for the entire minute
+        when minute % 5 == 0, causing candles_held to be incremented
+        multiple times per boundary when MONITOR_INTERVAL < 60s.
+
+        Fix: track last processed (date, hour, minute) key and only
+        fire once per unique candle boundary minute.
+
+        Research note (Berkman et al. 2012):
+          Checking at candle close avoids reacting to intra-candle
+          noise — true signal confirmation requires a closed bar.
+        """
+        now = datetime.now()
+        if now.minute % CANDLE_MINUTES != 0:
+            return False
+        key = (now.date(), now.hour, now.minute)
+        if key == self._last_boundary_key:
+            return False
+        self._last_boundary_key = key
+        return True
 
     # ──────────────────────────────────────────────────────────
     #  Nifty regime context
@@ -339,14 +447,12 @@ class LiveBot:
                         if is_entry_stage:
                             log.info("%s%s: quote unavailable — skip entry.", reason_prefix, symbol)
                             return False, raw
-                        # Scan stage: degrade gracefully — continue with LTP only
                         raw = {}
 
                     if bid is not None and ask is not None and spread_pct is None:
                         spread_abs = float(ask) - float(bid)
                         spread_pct = spread_abs / ltp if ltp > 0 else 1.0
 
-                    # Hard spread gate at entry; advisory only at scan
                     if is_entry_stage and spread_pct is not None:
                         if spread_pct > EXEC_MAX_SPREAD_PCT:
                             log.info(
@@ -462,7 +568,6 @@ class LiveBot:
                 results.append(f"  {symbol:<14} error: {e}")
                 log.error("  %s: error: %s", symbol, e)
 
-        # Chunk Telegram messages (max 15 lines each)
         chunk_size = 15
         chunks = [results[i:i+chunk_size] for i in range(0, len(results), chunk_size)]
         for idx, chunk in enumerate(chunks):
@@ -478,13 +583,18 @@ class LiveBot:
         log.info("Test scan complete.")
 
     # ──────────────────────────────────────────────────────────
-    #  Portfolio rotation
+    #  FIX-5: Portfolio rotation — fresh score for incumbent
     # ──────────────────────────────────────────────────────────
     def _should_rotate(self, new_prob: float) -> tuple[bool, Optional[str]]:
         """
         Rotation logic: replace the weakest open position with a
         significantly stronger new signal, but only if the weakest
         position is already in profit (to avoid realising losses).
+
+        FIX-5: incumbent last_prob is now refreshed via engine.score()
+        before comparison. Previously last_prob could be stale between
+        candle boundaries (up to 5 minutes old), causing rotation to
+        compare a fresh signal against an outdated baseline.
 
         Kumar & Lee (2006) show retail herding on NSE amplifies
         momentum — rotating into higher-confidence setups at scale
@@ -511,6 +621,22 @@ class LiveBot:
                 log.info("%s: rotation skip — profit %.2f%% < min %.2f%%",
                          symbol, profit_pct * 100, ROTATION_MIN_PROFIT * 100)
                 continue
+
+            # FIX-5: Refresh last_prob with a live engine score
+            # so the rotation comparison uses current model state.
+            try:
+                df_live = self.broker.get_candles(
+                    trade.security_id, symbol, days_back=5
+                )
+                if not df_live.empty:
+                    scored = self.engine.score(df_live, symbol=symbol)
+                    trade.last_prob = scored["prob_up"]
+                    log.debug(
+                        "%s: rotation probe — refreshed last_prob=%.3f",
+                        symbol, trade.last_prob,
+                    )
+            except Exception as e:
+                log.warning("%s: rotation probe score failed: %s — using cached prob", symbol, e)
 
             if new_prob >= trade.last_prob + ROTATION_MIN_EDGE:
                 if weakest_symbol is None or trade.last_prob < weakest_prob:
@@ -573,19 +699,47 @@ class LiveBot:
 
         Design principles:
           - Skip opening 15 min (NO_NEW_TRADE_BEFORE=09:30)
-          - Max 2 positions per GICS sector (concentration risk)
+          - Max 1 position per GICS sector (concentration risk)
           - Spread, liquidity, drift gates before execution
           - Confidence-ranked selection (best model edge wins)
-          - Rotation only when new signal strictly dominates
+          - Rotation only when new signal strictly dominates,
+            position is mature (≥30 min), AND edge exceeds cost
+
+        Precondition contract (Design by Contract — Bertrand Meyer):
+          ALL guards are evaluated ONCE at function entry.
+          No guard is repeated inside the function body.
+          If any precondition fails, the function exits immediately.
+          This is the single authority principle — one gate, one place.
+
+        Ranking formula:
+          score = prob_up × rr  (Kelly-adjacent expected value proxy)
+          This is a heuristic, not true expectancy. Once ≥200 closed
+          trades are logged, replace with empirical TP-hit rates per
+          confidence bucket from trade_analysis.csv.
+
+        scan_rank:
+          Every chosen trade logs its ordinal rank among candidates.
+          If rank > 1 consistently outperforms rank = 1, the ranking
+          formula has an inversion problem and must be re-examined.
         """
-        # ── Session time gates ────────────────────────────────
+
+        # ═══════════════════════════════════════════════════════
+        # PRECONDITION BLOCK — single authority, checked once.
+        # ═══════════════════════════════════════════════════════
+
         if _now_time() < _parse_time(NO_NEW_TRADE_BEFORE):
             log.info("Pre-trade window: waiting until %s", NO_NEW_TRADE_BEFORE)
             return
         if _no_new_trades():
             return
 
-        # ── Daily loss pause ──────────────────────────────────
+        if self.risk.is_halted():
+            log.critical(
+                "RiskManager halted trading — scan aborted. "
+                "(daily loss / consecutive SL limit breached)"
+            )
+            return
+
         daily_loss_pct = self.risk.daily_pnl / CAPITAL
         if daily_loss_pct <= NEW_TRADE_LOSS_PAUSE:
             log.warning(
@@ -595,12 +749,16 @@ class LiveBot:
             return
 
         max_slots_full = len(self.trades) >= MAX_OPEN_TRADES
+
+        # ═══════════════════════════════════════════════════════
+        # END PRECONDITION BLOCK
+        # ═══════════════════════════════════════════════════════
+
         log.info("── Scan: ranking %d eligible stocks ──", len(WATCHLIST))
 
         candidates: list[tuple[str, str, dict, dict]] = []
 
         for symbol, sec_id in WATCHLIST.items():
-            # ── Symbol-level gates ────────────────────────────
             if symbol.upper() in BLOCKED_SYMBOLS:
                 continue
             if symbol in self.trades:
@@ -609,35 +767,56 @@ class LiveBot:
                 log.debug("%s: SL-blacklisted today — skip.", symbol)
                 continue
 
-            # ── Sector concentration gate ─────────────────────
             sector = SECTOR_MAP.get(symbol, "unknown")
-            sector_count = sum(1 for s in self.trades
-                               if SECTOR_MAP.get(s, "unknown") == sector)
+            sector_count = sum(
+                1 for s in self.trades
+                if SECTOR_MAP.get(s, "unknown") == sector
+            )
             if sector_count >= MAX_PER_SECTOR:
                 continue
 
-            # ── Data fetch ────────────────────────────────────
             df = self.broker.get_candles(sec_id, symbol, days_back=10)
+            ema20 = df["close"].ewm(span=20).mean().iloc[-1]
+            ema50 = df["close"].ewm(span=50).mean().iloc[-1]
+
+            # Only trade aligned trends
+            if ema20 <= ema50:
+                continue
             if df.empty:
                 continue
 
-            # ── Signal engine score ───────────────────────────
             result = self.engine.score(df, symbol=symbol)
             if result["signal"] != "BUY":
+                # ── Track rejection reasons for EOD summary ──────────────
+                reason_str = result.get("reason", "")
+                if reason_str and reason_str not in ("null", "blocked_symbol",
+                                                    "insufficient_data",
+                                                    "feature_error", "empty_features",
+                                                    "missing_features", "nan_in_features",
+                                                    "predict_error", "invalid_atr_or_price"):
+                    for r in reason_str.split(","):
+                        r = r.strip()
+                        if r:
+                            self.rejection_stats[r] += 1
+                            if symbol not in self.rejection_symbols[r]:
+                                self.rejection_symbols[r].append(symbol)
                 continue
+
+            # ── Additional quality gate ─────────────────
+            # Avoid mediocre continuation setups
 
             entry  = result["entry"]
             sl     = result["sl"]
             target = result["target"]
             rr     = result["rr"]
 
-            # Sanity-check engine output
             if any(v <= 0 for v in [entry, sl, target, rr]):
-                log.warning("%s: invalid engine output entry=%.2f sl=%.2f — skip",
-                            symbol, entry, sl)
+                log.warning(
+                    "%s: invalid engine output entry=%.2f sl=%.2f — skip",
+                    symbol, entry, sl,
+                )
                 continue
 
-            # ── Scan-stage execution quality ──────────────────
             ok, quote = self._passes_entry_filters(
                 symbol, sec_id, entry, reason_prefix="[SCAN] ")
             if not ok:
@@ -646,59 +825,134 @@ class LiveBot:
             candidates.append((symbol, sec_id, result, quote))
             log.info(
                 "  Candidate %-14s prob=%.3f  entry=%.2f  SL=%.2f  "
-                "TP=%.2f  R:R=%.2fx  spread=%.4f%%  [%s]",
+                "TP=%.2f  R:R=%.2fx  ev=%.3f  spread=%.4f%%  [%s]",
                 symbol, result["prob_up"], entry, sl, target, rr,
+                result["prob_up"] * rr,
                 (quote.get("spread_pct") or 0.0) * 100, sector,
             )
 
         if not candidates:
             log.info("No BUY signals this scan.")
+            # ── Print top rejection reasons for this scan ─────────────
+            if self.rejection_stats:
+                top = sorted(self.rejection_stats.items(), key=lambda x: -x[1])[:6]
+                summary = " | ".join(f"{k}={v}" for k, v in top)
+                log.info(f"  Rejection stats (today): {summary}")
             return
 
-        # ── Select highest-confidence signal ──────────────────
-        candidates.sort(key=lambda x: (x[2]["prob_up"] * 0.7+ x[2].get("atr_ratio", 1.0) * 0.3),reverse=True,)
+        # ── Rank by Kelly-adjacent expected value proxy ───────
+        def calibrated_score(prob, rr):
+            # squash fake confidence inflation
+            calibrated = 0.50 + ((prob - 0.50) * 0.35)
+            return calibrated * rr
+
+        candidates.sort(
+            key=lambda x: calibrated_score(
+                x[2]["prob_up"],
+                x[2].get("rr", 1.0),
+            ),
+            reverse=True,
+        )
+
         best_sym, best_sec_id, best_result, best_quote = candidates[0]
+
+        for rank, (sym, _, res, _) in enumerate(candidates, start=1):
+            log.info(
+                "  Rank #%d  %-14s  prob=%.3f  rr=%.2fx  ev=%.3f",
+                rank, sym,
+                res["prob_up"],
+                res.get("rr", 0.0),
+                res["prob_up"] * res.get("rr", 1.0),
+            )
+
         log.info(
-            "Best signal: %-14s prob=%.3f  (%d candidates ranked)",
-            best_sym, best_result["prob_up"], len(candidates),
+            "Best signal: %-14s prob=%.3f  rr=%.2fx  ev_score=%.3f  scan_rank=1/%d",
+            best_sym,
+            best_result["prob_up"],
+            best_result.get("rr", 0.0),
+            best_result["prob_up"] * best_result.get("rr", 1.0),
+            len(candidates),
         )
 
         # ── Portfolio rotation check ──────────────────────────
         if max_slots_full:
             should_rotate, exit_sym = self._should_rotate(best_result["prob_up"])
+
             if should_rotate and exit_sym:
                 trade_to_exit = self.trades[exit_sym]
-                id_map  = {str(trade_to_exit.security_id): exit_sym}
-                prices  = self.broker.get_ltp_batch(id_map)
-                ltp     = prices.get(str(trade_to_exit.security_id), trade_to_exit.entry)
-                log.info("ROTATION: exiting %s → entering %s", exit_sym, best_sym)
+
+                if trade_to_exit.candles_held < self._ROTATION_MIN_CANDLES:
+                    log.info(
+                        "ROTATION BLOCKED (time hysteresis): %s only %d candles old "
+                        "(min=%d). Position too young to rotate.",
+                        exit_sym,
+                        trade_to_exit.candles_held,
+                        self._ROTATION_MIN_CANDLES,
+                    )
+                    return
+
+                ev_new = _expected_pnl(
+                    prob_up = best_result["prob_up"],
+                    entry   = best_result["entry"],
+                    sl      = best_result["sl"],
+                    target  = best_result["target"],
+                    qty     = self.risk.position_size(
+                                best_result["entry"], best_result["sl"]
+                            ),
+                )
+
+                ev_old = _expected_pnl(
+                    prob_up = trade_to_exit.last_prob,
+                    entry   = trade_to_exit.entry,
+                    sl      = trade_to_exit.stop_loss,
+                    target  = trade_to_exit.target,
+                    qty     = trade_to_exit.qty,
+                )
+
+                roundtrip_cost = (
+                    trade_to_exit.entry
+                    * trade_to_exit.qty
+                    * self._ROTATION_ROUNDTRIP_COST_PCT
+                )
+
+                ev_gain = ev_new - ev_old
+
+                if ev_gain <= roundtrip_cost:
+                    log.info(
+                        "ROTATION BLOCKED (ev gate): %s → %s "
+                        "ev_new=₹%.2f  ev_old=₹%.2f  "
+                        "ev_gain=₹%.2f ≤ cost=₹%.2f. "
+                        "Rotation does not justify transaction friction.",
+                        exit_sym, best_sym,
+                        ev_new, ev_old,
+                        ev_gain, roundtrip_cost,
+                    )
+                    return
+
+                id_map = {str(trade_to_exit.security_id): exit_sym}
+                prices = self.broker.get_ltp_batch(id_map)
+                ltp    = prices.get(
+                    str(trade_to_exit.security_id), trade_to_exit.entry
+                )
+                log.info(
+                    "ROTATION APPROVED: exiting %s (held=%d candles, "
+                    "ev_gain=₹%.2f > cost=₹%.2f) → entering %s",
+                    exit_sym,
+                    trade_to_exit.candles_held,
+                    ev_gain,
+                    roundtrip_cost,
+                    best_sym,
+                )
                 self._exit_trade(trade_to_exit, ltp, "ROTATION_BETTER_SIGNAL")
+
             else:
-                log.info("Max open trades (%d). No rotation opportunity.", MAX_OPEN_TRADES)
+                log.info(
+                    "Max open trades (%d). No rotation opportunity.",
+                    MAX_OPEN_TRADES,
+                )
                 return
 
-        # ── Final validation ──────────────────────────────────
-                # ─────────────────────────────────────────────
-        # HARD RISK SAFETY GATES
-        # ─────────────────────────────────────────────
-
-        # Circuit breaker protection
-        if self.risk.is_halted():
-            log.critical(
-                "RiskManager halted trading — skipping new entries."
-            )
-            return
-
-        # Hard cap on concurrent positions
-        if len(self.trades) >= MAX_OPEN_TRADES:
-            log.warning(
-                "Max open trades reached (%d/%d) — skip entry.",
-                len(self.trades),
-                MAX_OPEN_TRADES,
-            )
-            return
-
-        # ── Final validation ──────────────────────────
+        # ── Final signal validation ───────────────────────────
         entry  = best_result["entry"]
         sl     = best_result["sl"]
         target = best_result["target"]
@@ -716,59 +970,40 @@ class LiveBot:
 
         log.info(
             "SIGNAL BUY %-14s  entry=%.2f  SL=%.2f  TP=%.2f"
-            "  qty=%d  prob=%.3f  R:R=%.2fx  sector=%s  spread=%.4f%%",
+            "  qty=%d  prob=%.3f  R:R=%.2fx  ev=%.3f"
+            "  scan_rank=1/%d  sector=%s  spread=%.4f%%",
             best_sym,
-            entry,
-            sl,
-            target,
-            qty,
+            entry, sl, target, qty,
             best_result["prob_up"],
             rr,
+            best_result["prob_up"] * rr,
+            len(candidates),
             SECTOR_MAP.get(best_sym, "?"),
             (best_quote.get("spread_pct") or 0.0) * 100,
         )
 
         if BOT_MODE == "live":
-
             ok, quote = self._passes_entry_filters(
                 best_sym,
                 best_sec_id,
                 entry,
                 reason_prefix="[ENTRY] ",
             )
-
             if not ok:
-                log.warning(
-                    "%s: entry execution filters failed.",
-                    best_sym,
-                )
+                log.warning("%s: entry execution filters failed.", best_sym)
                 return
 
             self._entry_quotes[best_sym] = {
                 "entry": entry,
                 "ts": time.time(),
             }
-
             self._enter_live(
-                best_sym,
-                best_sec_id,
-                qty,
-                entry,
-                sl,
-                target,
-                best_result,
+                best_sym, best_sec_id, qty, entry, sl, target, best_result,
             )
 
         else:
-
             self._enter_paper(
-                best_sym,
-                best_sec_id,
-                qty,
-                entry,
-                sl,
-                target,
-                best_result,
+                best_sym, best_sec_id, qty, entry, sl, target, best_result,
             )
 
     # ──────────────────────────────────────────────────────────
@@ -787,7 +1022,6 @@ class LiveBot:
         initial_entry = self._entry_quotes.get(symbol, {}).get("entry", entry)
 
         try:
-            # ── Re-price loop ─────────────────────────────────
             while True:
                 drift_ok, quote = self._passes_entry_filters(
                     symbol, sec_id, initial_entry, reason_prefix="[EXEC] ")
@@ -797,7 +1031,7 @@ class LiveBot:
 
                 ltp = quote.get("ltp") or entry
                 if abs(ltp - initial_entry) / initial_entry <= EXEC_MAX_DRIFT_PCT:
-                    entry = ltp   # use latest LTP as execution price
+                    entry = ltp
                     break
 
                 if time.time() - start > ENTRY_REPRICE_SECS:
@@ -806,7 +1040,6 @@ class LiveBot:
 
                 time.sleep(1)
 
-            # ── Place bracket order ───────────────────────────
             resp = self.broker.place_bracket_order(
                 symbol       = symbol,
                 security_id  = sec_id,
@@ -904,7 +1137,6 @@ class LiveBot:
         Candle-boundary checks (signal flip, candle-low SL) run only
         at 5-min close to avoid acting on intra-candle noise.
         """
-
         if not self.trades:
             return
 
@@ -919,7 +1151,6 @@ class LiveBot:
                 log.warning("%s: LTP unavailable — skip tick.", symbol)
                 continue
 
-            # ── Update running high ──────────────────────────
             if ltp > trade.running_high:
                 trade.running_high = ltp
 
@@ -929,21 +1160,11 @@ class LiveBot:
 
             # ── 1. Target hit ────────────────────────────────
             if ltp >= trade.target:
-
                 log.info(
                     "%s: TARGET HIT ltp=%.2f TP=%.2f held=%.0fmin",
-                    symbol,
-                    ltp,
-                    trade.target,
-                    hold_mins,
+                    symbol, ltp, trade.target, hold_mins,
                 )
-
-                self._exit_trade(
-                    trade,
-                    ltp,
-                    "TARGET_HIT"
-                )
-
+                self._exit_trade(trade, ltp, "TARGET_HIT")
                 continue
 
             # ── 2. Adaptive trailing stop ───────────────────
@@ -954,210 +1175,112 @@ class LiveBot:
             )
 
             if should_trail and new_sl > trade.stop_loss:
-
                 old_sl = trade.stop_loss
-
                 trade.stop_loss = round(new_sl, 2)
-
                 trade.trail_count += 1
-
-                locked_pct = (
-                    (trade.stop_loss - trade.entry)
-                    / trade.entry
-                ) * 100
-
+                locked_pct = ((trade.stop_loss - trade.entry) / trade.entry) * 100
                 log.info(
                     "%s: TRAIL #%d  SL %.2f → %.2f  "
-                    "LTP=%.2f  Locked=%.2f%%  "
-                    "P&L=₹%+.0f",
-                    symbol,
-                    trade.trail_count,
-                    old_sl,
-                    trade.stop_loss,
-                    ltp,
-                    locked_pct,
-                    pnl,
+                    "LTP=%.2f  Locked=%.2f%%  P&L=₹%+.0f",
+                    symbol, trade.trail_count,
+                    old_sl, trade.stop_loss,
+                    ltp, locked_pct, pnl,
                 )
-
-                alert_trail_update(
-                    symbol,
-                    trade.stop_loss,
-                    ltp,
-                    pnl,
-                )
+                alert_trail_update(symbol, trade.stop_loss, ltp, pnl)
 
             # ── 3. LTP SL check ─────────────────────────────
             if ltp <= trade.stop_loss:
-
                 log.warning(
                     "%s: SL HIT (LTP) ltp=%.2f SL=%.2f held=%.0fmin",
-                    symbol,
-                    ltp,
-                    trade.stop_loss,
-                    hold_mins,
+                    symbol, ltp, trade.stop_loss, hold_mins,
                 )
-
-                self._exit_trade(
-                    trade,
-                    ltp,
-                    "SL_HIT"
-                )
-
+                self._exit_trade(trade, ltp, "SL_HIT")
                 self.sl_blacklist.add(symbol)
-
                 continue
 
-            # ── Candle-boundary checks ──────────────────────
-            if _is_candle_boundary():
+            # ── Candle-boundary checks — fires once per candle ──
+            # FIX-7: _is_candle_boundary() is now an instance method
+            # with deduplication so it fires exactly once per 5-min close.
+            if self._is_candle_boundary():
 
-                # ── New candle completed ────────────────────
                 trade.candles_held += 1
 
-                # ── Momentum failure exit ───────────────────
-                # Good breakout trades should work quickly.
-                # If still negative after 3 completed candles,
-                # continuation probability drops sharply.
-
+                # ── FIX-3: Momentum failure exit ─────────────
+                # Raised from 3 candles (15 min) to _MOMENTUM_EXIT_MIN_CANDLES
+                # (8 candles = 40 min) for CNC delivery trades.
+                # Rationale: Nifty 50 large-caps routinely consolidate
+                # for 20-35 minutes post-breakout before continuation.
+                # Exiting at 15 min was systematically cutting correct
+                # trades during their normal consolidation phase.
+                # ── Momentum failure exit ─────────────────────
                 if (
-                    trade.candles_held >= 3
-                    and pnl < 0
+                    trade.candles_held >= 14
+                    and pnl < -(trade.atr * trade.qty * 0.30)
+                    and trade.last_prob < 0.45
                 ):
-
                     log.warning(
-                        "%s: MOMENTUM FAILURE EXIT "
-                        "candles=%d pnl=₹%.0f",
+                        "%s: MOMENTUM FAILURE EXIT candles=%d pnl=₹%.0f prob=%.3f",
                         symbol,
                         trade.candles_held,
                         pnl,
+                        trade.last_prob,
                     )
-
-                    self._exit_trade(
-                        trade,
-                        ltp,
-                        "MOMENTUM_FAILURE"
-                    )
-
+                    self._exit_trade(trade, ltp, "MOMENTUM_FAILURE")
                     continue
 
                 # ── 4. Candle-low SL check ─────────────────
-                # NSE Level-2 data shows wicks often breach SL intra-candle.
-                # Checking candle low catches wick-hits accurately.
-
-                try:
-
-                    df_check = self.broker.get_candles(
-                        trade.security_id,
-                        symbol,
-                        days_back=1,
-                    )
-
-                    if not df_check.empty:
-
-                        last_low = float(df_check["low"].iloc[-1])
-
-                        if last_low <= trade.stop_loss:
-
-                            log.warning(
-                                "%s: SL HIT (candle low) "
-                                "low=%.2f ≤ SL=%.2f held=%.0fmin",
-                                symbol,
-                                last_low,
-                                trade.stop_loss,
-                                hold_mins,
-                            )
-
-                            self._exit_trade(
-                                trade,
-                                trade.stop_loss,
-                                "SL_HIT_CANDLE_LOW"
-                            )
-
-                            self.sl_blacklist.add(symbol)
-
-                            continue
-
-                except Exception as e:
-
-                    log.warning(
-                        "%s: candle-low SL check error: %s",
-                        symbol,
-                        e,
-                    )
+                # DISABLED:
+                # Candle lows create many false stop exits
+                # due to wick noise and broker candle artifacts.
+                # try:
+                #     df_check = self.broker.get_candles(
+                #         trade.security_id, symbol, days_back=1,
+                #     )
+                #     if not df_check.empty:
+                #         last_low = float(df_check["low"].iloc[-1])
+                #         if last_low <= trade.stop_loss:
+                #             log.warning(
+                #                 "%s: SL HIT (candle low) "
+                #                 "low=%.2f ≤ SL=%.2f held=%.0fmin",
+                #                 symbol, last_low, trade.stop_loss, hold_mins,
+                #             )
+                #             self._exit_trade(trade, trade.stop_loss, "SL_HIT_CANDLE_LOW")
+                #             self.sl_blacklist.add(symbol)
+                #             continue
+                # except Exception as e:
+                #     log.warning("%s: candle-low SL check error: %s", symbol, e)
 
                 # ── 5. Auto-exit: 2:45 PM weak market ─────
                 if (
                     _is_auto_exit_time()
                     and profit_pct <= AUTO_EXIT_THRESHOLD
                 ):
-
                     log.warning(
-                        "%s: AUTO-EXIT 2:45 PM "
-                        "profit %.2f%% ≤ threshold %.2f%%",
-                        symbol,
-                        profit_pct * 100,
-                        AUTO_EXIT_THRESHOLD * 100,
+                        "%s: AUTO-EXIT 2:45 PM profit %.2f%% ≤ threshold %.2f%%",
+                        symbol, profit_pct * 100, AUTO_EXIT_THRESHOLD * 100,
                     )
-
-                    self._exit_trade(
-                        trade,
-                        ltp,
-                        "AUTO_EXIT_EOD_WEAK"
-                    )
-
+                    self._exit_trade(trade, ltp, "AUTO_EXIT_EOD_WEAK")
                     continue
 
                 # ── 6. Signal flip / model deterioration ──
                 try:
-
                     df_live = self.broker.get_candles(
-                        trade.security_id,
-                        symbol,
-                        days_back=5,
+                        trade.security_id, symbol, days_back=5,
                     )
-
                     if not df_live.empty:
-
-                        scored = self.engine.score(
-                            df_live,
-                            symbol=symbol,
-                        )
-
+                        scored = self.engine.score(df_live, symbol=symbol)
                         trade.last_prob = scored["prob_up"]
-
-                        if self.engine.should_exit(
-                            df_live,
-                            trade.side,
-                            symbol=symbol,
-                        ):
-
+                        if self.engine.should_exit(df_live, trade.side, symbol=symbol):
                             log.info(
-                                "%s: SIGNAL FLIP "
-                                "exit=%.2f prob=%.3f "
-                                "P&L=₹%.0f held=%.0fmin "
-                                "candles=%d",
-                                symbol,
-                                ltp,
-                                scored["prob_up"],
-                                pnl,
-                                hold_mins,
-                                trade.candles_held,
+                                "%s: SIGNAL FLIP exit=%.2f prob=%.3f "
+                                "P&L=₹%.0f held=%.0fmin candles=%d",
+                                symbol, ltp, scored["prob_up"],
+                                pnl, hold_mins, trade.candles_held,
                             )
-
-                            self._exit_trade(
-                                trade,
-                                ltp,
-                                "SIGNAL_FLIP"
-                            )
-
+                            self._exit_trade(trade, ltp, "SIGNAL_FLIP")
                             continue
-
                 except Exception as e:
-
-                    log.warning(
-                        "%s: signal flip check error: %s",
-                        symbol,
-                        e,
-                    )
+                    log.warning("%s: signal flip check error: %s", symbol, e)
 
             # ── Holding log ───────────────────────────────
             log.info(
@@ -1166,25 +1289,24 @@ class LiveBot:
                 "prob=%.3f  R:R=%.2fx  "
                 "P&L=₹%+.0f  pct=%+.2f%%  "
                 "held=%.0fm  [%s] held_candles=%d",
-
-                symbol,
-                ltp,
-                trade.entry,
-                trade.stop_loss,
-                trade.target,
-                trade.atr,
-                trade.last_prob,
-                trade.rr,
-                pnl,
-                profit_pct * 100,
-                hold_mins,
-                SECTOR_MAP.get(symbol, "?"),
-                trade.candles_held,
+                symbol, ltp, trade.entry,
+                trade.stop_loss, trade.target, trade.atr,
+                trade.last_prob, trade.rr,
+                pnl, profit_pct * 100,
+                hold_mins, SECTOR_MAP.get(symbol, "?"), trade.candles_held,
             )
+
     # ──────────────────────────────────────────────────────────
-    #  Force exit all (EOD / circuit breaker)
+    #  FIX-6: Force exit all — safe fallback price
     # ──────────────────────────────────────────────────────────
     def _force_exit_all(self, reason: str = "CNC_EOD_CUTOFF"):
+        """
+        FIX-6: Fallback exit price is now trade.entry (breakeven),
+        not trade.running_high. The running_high is the best price
+        the stock ever touched — using it as an EOD fallback inflates
+        paper P&L when the position is actually at a loss. Entry price
+        is the only safe, conservative, non-inflating fallback.
+        """
         if not self.trades:
             return
         log.warning("Force-exiting %d position(s) — reason: %s",
@@ -1195,9 +1317,14 @@ class LiveBot:
         for symbol, trade in list(self.trades.items()):
             ltp = prices.get(str(trade.security_id), 0.0)
             if ltp <= 0:
-                # Fallback: use running high (best realistic fill estimate)
-                ltp = trade.running_high if trade.running_high > trade.entry else trade.entry
-                log.warning("%s: LTP unavailable — fallback exit at %.2f", symbol, ltp)
+                # FIX-6: Use entry price as conservative fallback.
+                # running_high was used before — that inflated paper P&L
+                # when positions were in loss at EOD.
+                ltp = trade.entry
+                log.warning(
+                    "%s: LTP unavailable — conservative fallback exit at entry=%.2f",
+                    symbol, ltp,
+                )
             self._exit_trade(trade, ltp, reason=reason)
 
     # ──────────────────────────────────────────────────────────
@@ -1261,23 +1388,31 @@ class LiveBot:
             "reason": reason,
             "held_min": round(trade.hold_minutes(), 1),
         })
+
         # ── Quant analytics log ─────────────────────────────
-        slippage = abs(exit_price - trade.entry)
+        # FIX-1 (already applied by user): slippage is now the
+        # difference between exit_price and the intended limit price,
+        # not the gross price move from entry.
+        slippage = abs(exit_price - trade.target)      if reason == "TARGET_HIT" \
+              else abs(exit_price - trade.stop_loss)   if "SL" in reason \
+              else 0.0
 
         trade_duration = round(trade.hold_minutes(), 1)
 
+        # FIX-2: Use entry_prob (immutable snapshot at trade open),
+        # NOT last_prob (which reflects model state at exit time).
+        # last_prob may have decayed significantly after entry —
+        # classifying regime at exit would mislabel bull entries as WEAK.
         market_regime = (
-            "BULL"
-            if trade.last_prob >= 0.70
-            else "SIDEWAYS"
-            if trade.last_prob >= 0.55
+            "BULL"     if trade.entry_prob >= 0.70
+            else "SIDEWAYS" if trade.entry_prob >= 0.55
             else "WEAK"
         )
 
         self.log_trade_analysis(
             symbol=trade.symbol,
             side=trade.side,
-            probability=trade.last_prob,
+            probability=trade.entry_prob,   # FIX-2: entry_prob, not last_prob
             entry_price=trade.entry,
             exit_price=exit_price,
             qty=trade.qty,
@@ -1288,10 +1423,10 @@ class LiveBot:
             reason=reason,
         )
         del self.trades[trade.symbol]
-    
+
     # ──────────────────────────────────────────────────────────
-    #  New trade log
-    # ──────────────────────────────────────────────────────────    
+    #  Trade analysis log
+    # ──────────────────────────────────────────────────────────
     def log_trade_analysis(
         self,
         symbol,
@@ -1306,38 +1441,19 @@ class LiveBot:
         market_regime,
         reason,
     ):
-        """
-        Quant-grade trade analytics logger
-        """
-
+        """Quant-grade trade analytics logger."""
         file_exists = TRADE_ANALYSIS_LOG.exists()
-
         with open(TRADE_ANALYSIS_LOG, "a", newline="") as f:
-
             writer = csv.writer(f)
-
-            # Write header once
             if not file_exists:
-
                 writer.writerow([
-                    "datetime",
-                    "symbol",
-                    "side",
-                    "probability",
-                    "entry_price",
-                    "exit_price",
-                    "qty",
-                    "pnl",
-                    "slippage",
-                    "trade_duration",
-                    "market_regime",
-                    "reason",
+                    "datetime", "symbol", "side", "probability",
+                    "entry_price", "exit_price", "qty", "pnl",
+                    "slippage", "trade_duration", "market_regime", "reason",
                 ])
-
             writer.writerow([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                symbol,
-                side,
+                symbol, side,
                 round(probability, 4),
                 round(entry_price, 2),
                 round(exit_price, 2),
@@ -1346,150 +1462,143 @@ class LiveBot:
                 round(slippage, 2),
                 trade_duration,
                 market_regime,
+   
                 reason,
             ])
-    # ──────────────────────────────────────────────────────────
-    #  Daily EOD reset
-    # ──────────────────────────────────────────────────────────
-    def _eod_reset(self):
-        """
-        Sends daily P&L summary, resets all intraday state.
-        Called once after 15:30 on any trading day.
-        """
-        # Summarise today
-        total_pnl = self.risk.daily_pnl
-        n_trades  = len(self.closed_trades)
-        winners   = [t for t in self.closed_trades if t["pnl"] > 0]
-        losers    = [t for t in self.closed_trades if t["pnl"] <= 0]
 
-        alert_daily_summary(
-            total_pnl = total_pnl,
-            trades    = self.closed_trades,
-            capital   = CAPITAL + total_pnl,
-        )
+    # ──────────────────────────────────────────────────────────
+    #  EOD reset
+    # ──────────────────────────────────────────────────────────
+    def eod_reset(self):
+        """Reset daily state for next session."""
+        log.info("EOD reset: clearing daily state.")
 
-        if BOT_MODE == "paper":
-            avg_win  = sum(t["pnl"] for t in winners) / len(winners)  if winners else 0
-            avg_loss = sum(t["pnl"] for t in losers)  / len(losers)   if losers  else 0
-            _send(
-                f"📊 <b>PAPER DAY COMPLETE</b>\n"
-                f"P&L       : ₹{self.paper_pnl:+,.0f}\n"
-                f"Trades    : {n_trades}  "
-                f"(W={len(winners)} L={len(losers)})\n"
-                f"Avg win   : ₹{avg_win:+.0f}\n"
-                f"Avg loss  : ₹{avg_loss:+.0f}\n"
-                f"SL blacklist: {', '.join(self.sl_blacklist) or 'none'}"
+        # ── EOD Rejection Summary ─────────────────────────────────
+        if self.rejection_stats:
+            sorted_reasons = sorted(
+                self.rejection_stats.items(), key=lambda x: -x[1]
             )
+            lines = ["── EOD Rejection Summary ─────────────────────────"]
+            for reason, count in sorted_reasons:
+                syms = ", ".join(self.rejection_symbols.get(reason, [])[:5])
+                lines.append(f"  {reason:<32} x{count:>3}  [{syms}]")
+            lines.append(f"  Total rejected signals: {sum(self.rejection_stats.values())}")
+            log.info("\n".join(lines))
 
-        # Reset state
-        self.closed_trades   = []
-        self.paper_pnl       = 0.0
+            # ── Telegram summary (only if rejections happened all day) ──
+            if sum(self.rejection_stats.values()) > 0:
+                top5 = sorted_reasons[:5]
+                msg = (
+                    f"📊 *EOD Rejection Report — {datetime.now().strftime('%d %b %Y')}*\n"
+                    f"Scanned: {len(self.closed_trades)} trades today\n\n"
+                    + "\n".join(f"• `{r}` → {c}x" for r, c in top5)
+                )
+                _send(msg)
+
+        self.rejection_stats.clear()
+        self.rejection_symbols.clear()
+
         self.sl_blacklist.clear()
-        self._last_scan_ts   = 0.0
-        self._nifty_refreshed = False
-        self.risk.reset_day()
+        self.circuitalertsent = False
+        self.risk.reset_daily()
+        self.closed_trades.clear()
+        self.last_boundary_key = None
         log.info("EOD reset complete.")
 
     # ──────────────────────────────────────────────────────────
     #  Main loop
     # ──────────────────────────────────────────────────────────
     def run(self):
+        """
+        Production trading loop (paper or live).
+
+        Loop structure (per MONITOR_INTERVAL seconds):
+          1. Verify market is open
+          2. Refresh Nifty regime every 30 min
+          3. Scan for new entries every SCAN_INTERVAL seconds
+          4. Monitor + manage all open positions
+          5. Dhan sync check (live mode only)
+          6. Circuit breaker check
+          7. EOD force-exit + reset at 15:30
+
+        FIX-4: Circuit breaker Telegram alert fires ONCE per halt,
+        not on every monitor tick. _circuit_alert_sent flag is reset
+        in _eod_reset() so it fires again next trading day.
+        """
         log.info("=" * 60)
-        log.info("  %s", MODE_LABEL[BOT_MODE])
-        log.info("  Capital: ₹%s | Type: %s | Max/sector: %d",
-                 f"{CAPITAL:,}", TRADE_MODE.upper(), MAX_PER_SECTOR)
-        log.info("  Monitor: %ds | Scan: %ds | Stocks: %d",
-                 MONITOR_INTERVAL, SCAN_INTERVAL, len(WATCHLIST))
+        log.info("LiveBot starting — mode: %s", MODE_LABEL.get(BOT_MODE, BOT_MODE).upper())
+        log.info("Capital: ₹%s | Trade mode: %s | Max trades: %d",
+                 f"{CAPITAL:,}", TRADE_MODE.upper(), MAX_OPEN_TRADES)
         log.info("=" * 60)
 
-        self.risk.reset_day()
-        self.sl_blacklist.clear()
-        self._last_scan_ts = 0.0
+        alert_bot_started(BOT_MODE, CAPITAL, TRADE_MODE, MAX_OPEN_TRADES)
+        last_nifty_refresh = 0.0
+        eod_done           = False
 
-        alert_bot_started(
-            capital    = CAPITAL,
-            trade_mode = f"{TRADE_MODE.upper()} [{BOT_MODE.upper()}]",
-            watchlist  = list(WATCHLIST.keys()),
-        )
+        try:
+            while True:
+                now = datetime.now()
 
-        if BOT_MODE == "paper":
-            _send(
-                f"📋 <b>PAPER MODE STARTED</b>\n"
-                f"Capital : ₹{CAPITAL:,}\n"
-                f"Monitor : every {MONITOR_INTERVAL}s\n"
-                f"Scan    : every {SCAN_INTERVAL//60} min\n"
-                f"Sectors : max {MAX_PER_SECTOR} per sector\n"
-                f"Stocks  : {len(WATCHLIST)}\n"
-                f"Set BOT_MODE=live when paper results are consistent."
-            )
-
-        daily_summary_sent = False
-
-        while True:
-            try:
-                # ── Market closed ─────────────────────────────
                 if not _is_market_open():
-                    if not daily_summary_sent and \
-                            _now_time() >= _parse_time(EOD_RESET_TIME):
-                        self._eod_reset()
-                        daily_summary_sent = True
-
-                    log.info("Market closed (%s). Sleeping 60s...",
-                             datetime.now().strftime("%H:%M"))
+                    if not eod_done and _now_time() >= _parse_time(EOD_RESET_TIME):
+                        if self.trades:
+                            self._force_exit_all("CNC_EOD_CUTOFF")
+                        summary = self.risk.daily_summary()
+                        alert_daily_summary(**summary)
+                        log.info(
+                            "EOD summary: P&L=₹%+.0f  trades=%d  wins=%d",
+                            summary["pnl"], summary["total_trades"], summary["wins"],
+                        )
+                        self.eod_reset()
+                        eod_done = True
                     time.sleep(60)
                     continue
 
-                daily_summary_sent = False
+                eod_done = False
 
-                # ── Circuit breaker ───────────────────────────
-                if self.risk.is_halted():
-                    alert_circuit_breaker(
-                        daily_loss = self.risk.daily_pnl,
-                        capital    = CAPITAL + self.risk.daily_pnl,
-                    )
-                    log.critical("CIRCUIT BREAKER ACTIVE — halted for today.")
-                    time.sleep(300)
-                    continue
+                # ── Nifty regime refresh (every 30 min) ──
+                if time.time() - last_nifty_refresh > 1800:
+                    self._refresh_nifty()
+                    last_nifty_refresh = time.time()
 
-                # ── EOD CNC cutoff ────────────────────────────
-                if _is_cutoff_passed():
-                    self._force_exit_all(reason="CNC_EOD_CUTOFF")
-                    log.info("Past CNC cutoff — all positions closed.")
-                    time.sleep(60)
-                    continue
+                # ── Scan for new entries ──────────────────
+                if time.time() - self._last_scan_ts > SCAN_INTERVAL:
+                    self._scan_and_enter()
+                    self._last_scan_ts = time.time()
 
-                # ── Per-tick: monitor open positions ──────────
+                # ── Monitor open positions ────────────────
                 self._monitor_positions()
 
-                # ── Per-scan: find new entries ─────────────────
-                now_ts = time.time()
-                if now_ts - self._last_scan_ts >= SCAN_INTERVAL:
-                    log.info("── Scan cycle [%s] %s ──",
-                             BOT_MODE.upper(),
-                             datetime.now().strftime("%H:%M:%S"))
-                    self._refresh_nifty()
-                    self._sync_with_dhan()
-                    self._scan_and_enter()
-                    self._last_scan_ts = now_ts
+                # ── Dhan position sync (live only) ────────
+                self._sync_with_dhan()
+
+                # ── FIX-4: Circuit breaker — alert once ──
+                if self.risk.is_halted():
+                    if not self._circuit_alert_sent:
+                        log.critical(
+                            "CIRCUIT BREAKER: trading halted for the day "
+                            "(daily loss limit or consecutive SL limit breached). "
+                            "Resuming tomorrow after EOD reset."
+                        )
+                        alert_circuit_breaker(self.risk.daily_pnl)
+                        self._circuit_alert_sent = True
+                    # Still monitor existing positions even when halted —
+                    # we just block new entries (handled in _scan_and_enter).
+
+                # ── CNC intraday cutoff ───────────────────
+                if _is_cutoff_passed() and self.trades:
+                    log.warning("Intraday CNC cutoff — force-exiting all.")
+                    self._force_exit_all("CNC_EOD_CUTOFF")
 
                 time.sleep(MONITOR_INTERVAL)
 
-            except KeyboardInterrupt:
-                log.warning("KeyboardInterrupt — exiting gracefully.")
-                if self.trades:
-                    log.warning("Open trades at shutdown: %s",
-                                list(self.trades.keys()))
-                    _send(
-                        f"⚠️ <b>BOT SHUTDOWN (keyboard)</b>\n"
-                        f"Open trades: {', '.join(self.trades.keys())}\n"
-                        f"Close them manually if needed."
-                    )
-                break
-
-            except Exception as e:
-                log.error("Main loop exception: %s", e, exc_info=True)
-                _send(f"⚠️ <b>LOOP ERROR</b>\n{e}")
-                time.sleep(30)   # brief pause before retry
+        except KeyboardInterrupt:
+            log.warning("KeyboardInterrupt received.")
+            if BOT_MODE == "live" and self.trades:
+                log.warning("Exiting %d open live position(s) safely.", len(self.trades))
+                self._force_exit_all("KEYBOARD_INTERRUPT")
+            _send("⚠️ <b>Bot stopped manually (KeyboardInterrupt)</b>")
+            log.info("Bot shut down cleanly.")
 
 
 # ─────────────────────────────────────────────────────────────

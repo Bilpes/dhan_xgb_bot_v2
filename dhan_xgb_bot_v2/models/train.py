@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from data.features import build_features, FEATURE_COLS
-from bot.trade_policy import HORIZON
+#from bot.trade_policy import HORIZON
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -52,7 +52,7 @@ PARAMS = dict(
 
     # ── Core ───────────────────────────────────────────────
     n_estimators=700,
-    max_depth=6,
+    max_depth=5,
     learning_rate=0.025,
 
     # ── Regularisation ─────────────────────────────────────
@@ -79,11 +79,11 @@ PARAMS = dict(
 # Training Config
 # ─────────────────────────────────────────────────────────────
 N_SPLITS            = 5
-PREDICTION_THRESHOLD = 0.60
+PREDICTION_THRESHOLD = 0.72
 
 MIN_ACC    = 0.53
 MIN_AUC    = 0.55
-MIN_PREC   = 0.50
+MIN_PREC   = 0.55
 MIN_TRADES = 50
 
 # ─────────────────────────────────────────────────────────────
@@ -177,9 +177,15 @@ def load_all_stocks() -> tuple[pd.DataFrame, pd.DataFrame]:
 # ─────────────────────────────────────────────────────────────
 # ATR-style Labels
 # ─────────────────────────────────────────────────────────────
-def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
-
-    from bot.trade_policy import TP_PCT, SL_PCT, HORIZON
+# ─────────────────────────────────────────────────────────────
+# Momentum continuation labels
+# Predict sustained expansion after entry
+# ─────────────────────────────────────────────────────────────
+def _make_continuation_labels(
+    feat: pd.DataFrame,
+    horizon: int = 6,
+    target_pct: float = 0.012,
+) -> pd.DataFrame:
 
     feat = (
         feat.copy()
@@ -193,39 +199,52 @@ def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
 
         g = g.reset_index(drop=True)
 
-        c = g["close"].values
-        h = g["high"].values
-        l = g["low"].values
+        # Future highest high within next N candles
+        future_high = pd.concat(
+            [
+                g["high"].shift(-i)
+                for i in range(1, horizon + 1)
+            ],
+            axis=1,
+        ).max(axis=1)
 
-        n = len(g)
+        future_low = pd.concat(
+            [
+                g["low"].shift(-i)
+                for i in range(1, horizon + 1)
+            ],
+            axis=1,
+        ).min(axis=1)
 
-        labels = np.zeros(n, dtype=int)
+        # Future downside risk
+        future_low = (
+            g["low"]
+            .shift(-1)
+            .rolling(horizon)
+            .min()
+        )
 
-        for i in range(n - HORIZON):
+        # Future expansion %
+        future_upside = (
+            (future_high - g["close"])
+            / (g["close"] + 1e-9)
+        )
 
-            entry = c[i]
+        # Future drawdown %
+        future_drawdown = (
+            (future_low - g["close"])
+            / (g["close"] + 1e-9)
+        )
 
-            if entry <= 0:
-                continue
-
-            tp = entry * (1 + TP_PCT)
-            sl = entry * (1 - SL_PCT)
-
-            for j in range(i + 1, min(i + 1 + HORIZON, n)):
-
-                if l[j] <= sl:
-                    break
-
-                if h[j] >= tp:
-                    labels[i] = 1
-                    break
-
-        g["target"] = labels
+        # Label only strong continuation moves
+        g["target"] = (
+            (future_upside > target_pct)
+            & (future_drawdown > -0.006)
+        ).astype(int)
 
         all_frames.append(g)
 
     return pd.concat(all_frames, ignore_index=True)
-
 # ─────────────────────────────────────────────────────────────
 # Prepare Dataset
 # ─────────────────────────────────────────────────────────────
@@ -240,11 +259,25 @@ def prepare_dataset(
         stock_df,
         nifty_df=nifty_df,
     )
+    
+    missing = [
+        c for c in FEATURE_COLS
+        if c not in feat.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Missing features: {missing}"
+        )
 
     # Replace temporary target
     feat = feat.drop(columns=["target"], errors="ignore")
 
-    feat = _make_atr_labels(feat)
+    feat = _make_continuation_labels(
+    feat,
+    horizon=6,
+    target_pct=0.012,
+)
 
     # Remove infinities
     feat = feat.replace([np.inf, -np.inf], np.nan)
@@ -277,7 +310,10 @@ def prepare_dataset(
 # ─────────────────────────────────────────────────────────────
 def walk_forward_eval(X, y):
 
-    tscv = TimeSeriesSplit(n_splits=N_SPLITS,gap=HORIZON)
+    tscv = TimeSeriesSplit(
+    n_splits=N_SPLITS,
+    gap=6,
+)
 
     oos_acc = []
     oos_auc = []

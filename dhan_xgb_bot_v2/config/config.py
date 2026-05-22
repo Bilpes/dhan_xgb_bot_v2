@@ -34,7 +34,7 @@ MAX_PER_SECTOR       = 1
 NO_NEW_TRADE_BEFORE  = "09:30"   # wait 15 min for market to settle
 ALLOW_SHORTS         = False
 # ── XGBoost signal thresholds ───────────────────────────────
-BUY_THRESHOLD        = 0.65
+#BUY_THRESHOLD        = 0.65
 SELL_THRESHOLD       = 0.38
 
 # ── Stop-loss settings ──────────────────────────────────────
@@ -43,8 +43,11 @@ ATR_MULTIPLIER_CNC   = 2.5         # wider stop for overnight holds
 ATR_MULTIPLIER_INTRA = 1.5         # tighter stop for intraday
 
 # ── Trailing stop ───────────────────────────────────────────
-TRAIL_AFTER_PCT      = 0.01       # activate after +1.5% profit
-TRAIL_DISTANCE       = 0.005       # trail 1% below running high
+# Activate trailing only after meaningful expansion
+TRAIL_AFTER_PCT      = 0.015     # activate after +1.5%
+
+# Allow healthy trend pullbacks without premature exit
+TRAIL_DISTANCE       = 0.012     # trail 1.2% below running high
 
 # ── position rotation ───────────────────────────────────────────
 ROTATION_ENABLED     = True    # allow switching to better opportunity
@@ -53,7 +56,7 @@ ROTATION_MIN_EDGE    = 0.05    # new signal must be 5% more confident
 
 
 # ===== ML =====
-MODEL_THRESHOLD   = 0.60
+#MODEL_THRESHOLD   = 0.60
 MIN_VOLUME_RATIO  = 1.2
 MIN_ATR_PCT       = 0.003
 

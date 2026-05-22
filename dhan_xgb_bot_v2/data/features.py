@@ -100,7 +100,14 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
 
     g["ema_cross"]    = g["ema_9"] - g["ema_21"]
     g["ema_cross_50"] = g["ema_21"] - g["ema_50"]
+    # ── EMA acceleration ───────────────────────────────────────
+    g["ema_spread"] = (
+        g["ema_9"] - g["ema_20"]
+    )
 
+    g["ema_spread_velocity"] = (
+        g["ema_spread"].diff(3)
+    )
     g["price_vs_ema9"]  = (c - g["ema_9"]) / (g["ema_9"] + 1e-9)
     g["price_vs_ema21"] = (c - g["ema_21"]) / (g["ema_21"] + 1e-9)
     g["price_vs_ema50"] = (c - g["ema_50"]) / (g["ema_50"] + 1e-9)
@@ -140,6 +147,14 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
     g["atr_ratio"] = (
         g["atr_14"]
         / (g["atr_14"].rolling(20).mean() + 1e-9)
+    )
+    
+    # ── Range expansion (momentum ignition) ───────────────────
+    g["range"] = h - l
+
+    g["range_expansion"] = (
+        g["range"]
+        / (g["range"].rolling(10).mean() + 1e-9)
     )
 
     bb_up, bb_lo = _bollinger(c)
@@ -181,7 +196,10 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
     g["vol_ratio"] = (
         v / (g["vol_ma20"] + 1e-9)
     )
-
+    # ── Volume acceleration ────────────────────────────────────
+    g["vol_acceleration"] = (
+        g["vol_ratio"].diff(3)
+    )
     g["vol_spike"] = (
         g["vol_ratio"] > 2.0
     ).astype(int)
@@ -263,7 +281,11 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
         & (g["body"] > 0.5)
         & (g["candle_body_pct"] > 0.003)
     ).astype(int)
-
+    # ── Candle closing pressure ────────────────────────────────
+    g["close_position_in_range"] = (
+        (c - l)
+        / ((h - l) + 1e-9)
+    )
     # ── Lagged returns ───────────────────────────────────────
     for lag in [1, 2, 3, 5, 8, 13]:
         g[f"ret_lag{lag}"] = c.pct_change(lag)
@@ -316,7 +338,15 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
         (g["high_20"] - g["low_20"])
         / (c + 1e-9)
     )
+    # ── Intraday strength persistence ──────────────────────────
+    g["day_high"] = (
+        h.groupby(g["trade_date"]).cummax()
+    )
 
+    g["distance_from_day_high"] = (
+        (g["day_high"] - c)
+        / (g["atr_14"] + 1e-9)
+    )
     # ── Breakout confirmation ────────────────────────────────
     g["prev_5_high"] = (
         h.rolling(5)
@@ -409,15 +439,15 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
 def build_features(
     df: pd.DataFrame,
     nifty_df: pd.DataFrame = None,
-    symbol: str = None,           # ← NEW: pass symbol name from train.py
+    symbol: str = None,
 ) -> pd.DataFrame:
     """
     Build all features for a DataFrame.
 
     Accepts EITHER:
-      (a) Multi-stock DataFrame with a 'symbol' column  (auto_retrain.py)
-      (b) Single-stock DataFrame without 'symbol'       (models/train.py)
-          → pass symbol='AXISBANK' or it defaults to 'STOCK'
+      (a) Multi-stock DataFrame with a 'symbol' column
+      (b) Single-stock DataFrame without 'symbol'
+          -> pass symbol='AXISBANK' or it defaults to 'STOCK'
 
     In both cases the output always has a 'symbol' column.
     """
@@ -431,26 +461,30 @@ def build_features(
         df["datetime"] = pd.to_datetime(df["datetime"])
 
     # ── Ensure symbol column exists ───────────────────────────
-    # Priority: existing column > caller-supplied name > filename stem
     if "symbol" not in df.columns:
         df["symbol"] = symbol if symbol else "STOCK"
 
-    df   = df.sort_values(["symbol", "datetime"]).reset_index(drop=True)
+    df = df.sort_values(["symbol", "datetime"]).reset_index(drop=True)
+
     feat = (
         df.groupby("symbol", group_keys=False)
           .apply(_build_symbol_features)
           .reset_index(drop=True)
     )
+
     if "symbol" not in feat.columns:
         base_cols = [c for c in ["datetime", "symbol"] if c in df.columns]
         feat = feat.merge(df[base_cols], on="datetime", how="left")
         if "symbol" not in feat.columns:
             feat["symbol"] = symbol if symbol else "STOCK"
 
-    # ── Nifty relative-strength features ─────────────────────
+    # ── Nifty relative-strength features (batch add) ─────────
+    nifty_block = pd.DataFrame(index=feat.index)
+
     if nifty_df is not None and not nifty_df.empty:
         try:
             nifty = nifty_df.copy()
+
             if "datetime" in nifty.columns:
                 nifty["datetime"] = pd.to_datetime(nifty["datetime"])
                 nifty = nifty.sort_values("datetime").set_index("datetime")
@@ -459,56 +493,74 @@ def build_features(
                 nifty = nifty.sort_index()
 
             nc = nifty["close"].reindex(feat["datetime"], method="ffill")
-            feat["nifty_roc5"]         = nc.pct_change(5).values
-            feat["rs_vs_nifty"]        = feat["roc_5"] - feat["nifty_roc5"]
-            feat["nifty_trend"]        = (_ema(nc, 9) - _ema(nc, 21)).values
-            feat["nifty_ret_1"]        = nc.pct_change(1).values
-            feat["nifty_ret_5"]        = nc.pct_change(5).values
-            feat["nifty_above_ema20"]  = (nc > nc.ewm(span=20).mean().shift(1)).astype(int).values
-            feat["nifty_rsi"]          = _rsi(nc, 14).values
-            feat["nifty_atr_pct"]      = (
-                _atr(
-                    nifty["high"].reindex(feat["datetime"], method="ffill"),
-                    nifty["low"].reindex(feat["datetime"],  method="ffill"),
-                    nc, 14,
-                ) / (nc + 1e-9)
+            nh = nifty["high"].reindex(feat["datetime"], method="ffill")
+            nl = nifty["low"].reindex(feat["datetime"], method="ffill")
+
+            nifty_block["nifty_roc5"] = nc.pct_change(5).values
+            nifty_block["rs_vs_nifty"] = feat["roc_5"].values - nifty_block["nifty_roc5"].values
+            nifty_block["rs_acceleration"] = pd.Series(
+                nifty_block["rs_vs_nifty"], index=feat.index
+            ).diff(3).values
+            nifty_block["nifty_trend"] = (_ema(nc, 9) - _ema(nc, 21)).values
+            nifty_block["nifty_ret_1"] = nc.pct_change(1).values
+            nifty_block["nifty_ret_5"] = nc.pct_change(5).values
+            nifty_block["nifty_above_ema20"] = (
+                nc > nc.ewm(span=20).mean().shift(1)
+            ).astype(int).values
+            nifty_block["nifty_rsi"] = _rsi(nc, 14).values
+            nifty_block["nifty_atr_pct"] = (
+                _atr(nh, nl, nc, 14) / (nc + 1e-9)
             ).values
+
         except Exception:
             for col in _NIFTY_COLS:
-                feat[col] = 0.0
+                nifty_block[col] = 0.0
+            nifty_block["rs_acceleration"] = 0.0
     else:
         for col in _NIFTY_COLS:
-            feat[col] = 0.0
+            nifty_block[col] = 0.0
+        nifty_block["rs_acceleration"] = 0.0
 
-    # ── Forward-return label (zero-leakage) ───────────────────
-    # Only created if 'target' column is NOT already present.
-    # train.py / auto_retrain.py create their own ATR-based labels AFTER
-    # calling build_features(); this default is a simple 1-bar return proxy.
+    feat = pd.concat([feat, nifty_block], axis=1)
+
+    # ── Forward-return label (batch add) ─────────────────────
     if "target" not in feat.columns:
-        future_ret     = feat.groupby("symbol")["close"].shift(-1) / feat["close"] - 1
-        feat["target"] = (future_ret > 0.003).astype(int)
+        future_ret = feat.groupby("symbol")["close"].shift(-1) / feat["close"] - 1
+        target_block = pd.DataFrame(
+            {"target": (future_ret > 0.003).astype(int)},
+            index=feat.index
+        )
+        feat = pd.concat([feat, target_block], axis=1)
 
-    # ── Force all features to use ONLY past candles ───────────
+    # Optional de-fragment after wide concat
+    feat = feat.copy()
+
+    # ── Force all features to use ONLY past candles ──────────
     feat[FEATURE_COLS] = (
         feat.groupby("symbol")[FEATURE_COLS]
-        .shift(1)
+            .shift(1)
     )
 
-    # ── Drop rows with NaN in any feature or target ───────────
+    # ── Drop rows with NaN in any feature or target ──────────
     drop_cols = [c for c in FEATURE_COLS + ["target"] if c in feat.columns]
 
     feat = (
         feat.dropna(subset=drop_cols)
-        .reset_index(drop=True)
+            .reset_index(drop=True)
     )
 
-    return feat 
-
+    return feat
 # ── Nifty column list (used in two places above) ─────────────
 _NIFTY_COLS = [
-    "nifty_roc5", "rs_vs_nifty", "nifty_trend",
-    "nifty_ret_1", "nifty_ret_5", "nifty_above_ema20",
-    "nifty_rsi", "nifty_atr_pct",
+    "nifty_roc5",
+    "rs_vs_nifty",
+    "rs_acceleration",
+    "nifty_trend",
+    "nifty_ret_1",
+    "nifty_ret_5",
+    "nifty_above_ema20",
+    "nifty_rsi",
+    "nifty_atr_pct",
 ]
 
 FEATURE_COLS = [
@@ -519,11 +571,11 @@ FEATURE_COLS = [
     # =========================================================
     "ema_cross",
     "ema_cross_50",
+    "ema_spread_velocity",
 
     "price_vs_ema9",
     "price_vs_ema21",
     "price_vs_ema50",
-
     #"ema_50",
 
     "trend_strength",
@@ -574,6 +626,8 @@ FEATURE_COLS = [
     "kc_position",
 
     "hvol_20",
+    
+    "range_expansion",
 
     # =========================================================
     # VOLUME + VWAP FLOW
@@ -581,6 +635,7 @@ FEATURE_COLS = [
     # =========================================================
     "vol_ratio",
     "vol_spike",
+    "vol_acceleration",
 
     "price_vs_vwap",
     "vwap_slope",
@@ -593,6 +648,8 @@ FEATURE_COLS = [
     # Order-flow footprint inside candle anatomy
     # =========================================================
     "hl_range",
+    
+    "close_position_in_range",
 
     "body",
     "upper_wick",
@@ -629,6 +686,8 @@ FEATURE_COLS = [
     "near_high50",
 
     "range_pct_20",
+    
+    "distance_from_day_high",
 
     "breakout_confirm",
 
@@ -660,6 +719,8 @@ FEATURE_COLS = [
     # =========================================================
     "nifty_roc5",
     "rs_vs_nifty",
+    
+    "rs_acceleration",
 
     "nifty_trend",
 

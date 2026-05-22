@@ -30,7 +30,13 @@ import pandas as pd
 # ── Trade quality filters ─────────────────────────
 MIN_VOLUME_RATIO = 1.2     # avoid dead candles
 MIN_ATR_PCT      = 0.003   # avoid low volatility chop
-MODEL_THRESHOLD  = 0.55    # confidence threshold
+MODEL_THRESHOLD  = 0.64    # confidence threshold
+# ── Momentum persistence filters ──────────────────
+MIN_RANGE_EXPANSION      = 1.05
+MIN_EMA_SPREAD_VELOCITY  = 0.0
+MAX_DIST_DAY_HIGH_ATR    = 1.25
+MIN_RS_ACCELERATION      = -0.0005
+MIN_CLOSE_RANGE_POS      = 0.60
 
 
 from data.features import build_features, FEATURE_COLS
@@ -107,7 +113,7 @@ class SignalEngine:
       .reload()                        -> None  (called after auto_retrain)
     """
 
-    def __init__(self, buy_threshold: float = BUY_THRESHOLD_DEFAULT):
+    def __init__(self, buy_threshold: float = MODEL_THRESHOLD):
         self.buy_threshold  = buy_threshold
         self.model          = None
         self.scaler         = None
@@ -229,9 +235,18 @@ class SignalEngine:
 
             X_scaled = self.scaler.transform(X_raw)
 
-            prob_up = float(
+            raw_prob = float(
                 self.model.predict_proba(X_scaled)[0, 1]
             )
+
+            # ── Confidence compression ─────────────────────────
+            # Financial ML probabilities are heavily overconfident.
+            # Compress extremes toward center.
+
+            prob_up = 0.50 + ((raw_prob - 0.50) * 0.45)
+
+            # Hard cap confidence range
+            prob_up = max(0.51, min(prob_up, 0.82))
 
         except Exception as e:
 
@@ -285,8 +300,14 @@ class SignalEngine:
         # =========================================================
         # SL / TARGET
         # =========================================================
-        sl_atr = entry - ATR_SL_MULT * atr
-        tp_atr = entry + ATR_TP_MULT * atr
+        # ── Dynamic ATR stop ─────────────────────
+        effective_atr = max(
+            atr,
+            entry * 0.0045   # minimum 0.45% volatility floor
+        )
+
+        sl_atr = entry - (ATR_SL_MULT * effective_atr)
+        tp_atr = entry + (ATR_TP_MULT * effective_atr)
 
         sl_cap = entry * (1 - STOP_LOSS_PCT)
 
@@ -337,6 +358,7 @@ class SignalEngine:
         market_ok = (
             row["nifty_above_ema20"] == 1
             and row["nifty_trend"] > 0
+            and row["nifty_rsi"] > 55
         )
 
         # =========================================================
@@ -344,6 +366,29 @@ class SignalEngine:
         # =========================================================
         volatility_expansion = (
             float(row["atr_ratio"]) > 1.1
+        )
+        
+        # =========================================================
+        # MOMENTUM PERSISTENCE
+        # =========================================================
+        range_expansion = float(
+            row.get("range_expansion", 0.0)
+        )
+
+        ema_spread_velocity = float(
+            row.get("ema_spread_velocity", 0.0)
+        )
+
+        distance_from_day_high = float(
+            row.get("distance_from_day_high", 999.0)
+        )
+
+        rs_acceleration = float(
+            row.get("rs_acceleration", 0.0)
+        )
+
+        close_position_in_range = float(
+            row.get("close_position_in_range", 0.0)
         )
 
         # =========================================================
@@ -372,7 +417,7 @@ class SignalEngine:
         # =========================================================
         # DYNAMIC THRESHOLD
         # =========================================================
-        dynamic_threshold = self.buy_threshold
+        dynamic_threshold = MODEL_THRESHOLD
 
         market_strong = (
             row["nifty_above_ema20"] == 1
@@ -386,11 +431,16 @@ class SignalEngine:
             or float(row["atr_ratio"]) < 1.0
         )
 
-        if market_strong:
-            dynamic_threshold = 0.58
+        if (
+            market_strong
+            and range_expansion > 1.3
+            and ema_spread_velocity > 0
+            and rs_acceleration > 0
+        ):
+            dynamic_threshold = 0.61
 
         elif market_weak:
-            dynamic_threshold = 0.70
+            dynamic_threshold = 0.67
 
         # =========================================================
         # REJECTION DEBUG ENGINE
@@ -408,6 +458,9 @@ class SignalEngine:
 
         if REQUIRE_BREAKOUT_CONFIRMATION and not breakout_ok:
             reject_reason.append("no_breakout")
+            
+        if not body_ok:
+            reject_reason.append("weak_candle_body")    
 
         if REQUIRE_VWAP_CONFIRM and current_close < vwap:
             reject_reason.append("below_vwap")
@@ -415,11 +468,30 @@ class SignalEngine:
         if TREND_STRENGTH_ENABLED and not trend_ok:
             reject_reason.append("weak_trend")
 
-        if dist_from_vwap > MAX_DISTANCE_FROM_VWAP:
+        if (
+            dist_from_vwap > MAX_DISTANCE_FROM_VWAP
+            or not not_extended
+        ):
             reject_reason.append("overextended")
 
         if not volatility_expansion:
             reject_reason.append("low_volatility")
+            
+        # ── Momentum persistence filters ─────────────────
+        if range_expansion < MIN_RANGE_EXPANSION:
+            reject_reason.append("weak_range_expansion")
+
+        if ema_spread_velocity <= MIN_EMA_SPREAD_VELOCITY:
+            reject_reason.append("slowing_trend")
+
+        if distance_from_day_high > MAX_DIST_DAY_HIGH_ATR:
+            reject_reason.append("far_from_day_high")
+
+        if rs_acceleration < MIN_RS_ACCELERATION:
+            reject_reason.append("weak_relative_strength")
+
+        if close_position_in_range < MIN_CLOSE_RANGE_POS:
+            reject_reason.append("weak_candle_close")    
 
         if avoid_lunch:
             reject_reason.append("lunch_chop")
@@ -443,10 +515,25 @@ class SignalEngine:
 
         else:
 
-            signal = "BUY"
-            reason = "passed"
+            # ── Final continuation confirmation ─────────────
+            strong_continuation = (
+                range_expansion > 1.5
+                and ema_spread_velocity > 0
+                and rs_acceleration > 0
+                and close_position_in_range > 0.60
+            )
 
-            self._weak_counts.pop(symbol, None)
+            if not strong_continuation:
+
+                signal = "HOLD"
+                reason = "weak_continuation"
+
+            else:
+
+                signal = "BUY"
+                reason = "passed"
+
+                self._weak_counts.pop(symbol, None)
 
         # =========================================================
         # DEBUG LOG
@@ -455,6 +542,11 @@ class SignalEngine:
             "%s prob=%.3f signal=%s reason=%s "
             "body=%.4f vol=%.2f trend=%s "
             "market=%s vol_exp=%s "
+            "range_exp=%.2f "
+            "ema_vel=%.4f "
+            "rs_acc=%.4f "
+            "day_high_dist=%.2f "
+            "close_pos=%.2f "
             "entry=%.2f SL=%.2f TP=%.2f "
             "R:R=%.2f ATR=%.4f",
 
@@ -467,6 +559,13 @@ class SignalEngine:
             trend_ok,
             market_ok,
             volatility_expansion,
+
+            range_expansion,
+            ema_spread_velocity,
+            rs_acceleration,
+            distance_from_day_high,
+            close_position_in_range,
+
             entry,
             sl,
             target,

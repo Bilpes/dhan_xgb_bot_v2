@@ -154,21 +154,35 @@ def alert_trail_update(symbol: str, new_sl: float, ltp: float, unrealised_pnl: f
     _send(msg)
 
 
-def alert_daily_summary(total_pnl: float, trades: list, capital: float):
+def alert_daily_summary(
+    pnl: float,
+    trades: list,
+    capital: float,
+    total_trades: int = 0,
+    wins: int = 0,
+    losses: int = 0,
+):
     """
     Sent at end of day (3:30 PM).
     Shows all trades with buy/sell prices.
     """
+
     time_str = datetime.now().strftime("%d %b %Y")
-    wins     = [t for t in trades if t["pnl"] > 0]
-    losses   = [t for t in trades if t["pnl"] <= 0]
-    pnl_sign = "+" if total_pnl >= 0 else ""
-    summary_emoji = "🏆" if total_pnl >= 0 else "📉"
+
+    # fallback safety
+    if not wins and not losses:
+        wins = len([t for t in trades if t["pnl"] > 0])
+        losses = len([t for t in trades if t["pnl"] <= 0])
+
+    pnl_sign = "+" if pnl >= 0 else ""
+    summary_emoji = "🏆" if pnl >= 0 else "📉"
 
     trade_lines = ""
+
     for t in trades:
         p_sign = "+" if t["pnl"] >= 0 else ""
         emoji  = "✅" if t["pnl"] >= 0 else "❌"
+
         trade_lines += (
             f"\n{emoji} <b>{t['symbol']}</b>  "
             f"Buy ₹{t['entry']:,.1f} → Sell ₹{t['exit']:,.1f}  "
@@ -178,14 +192,15 @@ def alert_daily_summary(total_pnl: float, trades: list, capital: float):
     msg = (
         f"{summary_emoji} <b>DAILY SUMMARY — {time_str}</b>\n"
         f"{'─' * 28}\n"
-        f"📊 Total trades  : {len(trades)}\n"
-        f"✅ Wins          : {len(wins)}\n"
-        f"❌ Losses        : {len(losses)}\n"
-        f"💰 Net P&L       : {pnl_sign}₹{abs(total_pnl):,.0f}\n"
+        f"📊 Total trades  : {total_trades}\n"
+        f"✅ Wins          : {wins}\n"
+        f"❌ Losses        : {losses}\n"
+        f"💰 Net P&L       : {pnl_sign}₹{abs(pnl):,.0f}\n"
         f"🏦 Capital now   : ₹{capital:,.0f}\n"
         f"{'─' * 28}"
         f"{trade_lines if trade_lines else chr(10) + 'No trades today.'}"
     )
+
     _send(msg)
 
 
@@ -203,19 +218,15 @@ def alert_circuit_breaker(daily_loss: float, capital: float):
     _send(msg)
 
 
-def alert_bot_started(capital: float, trade_mode: str, watchlist: list):
-    """Sent when bot starts each morning."""
-    msg = (
+def alert_bot_started(mode: str, capital: float, trade_mode: str, max_trades: int = 4):
+    _send(
         f"🤖 <b>BOT STARTED</b>\n"
-        f"{'─' * 28}\n"
-        f"💰 Capital       : ₹{capital:,.0f}\n"
-        f"🕐 Mode          : {trade_mode.upper()}\n"
-        f"👁 Watching      : {', '.join(watchlist[:5])}{'...' if len(watchlist) > 5 else ''}\n"
-        f"⏰ Started at    : {datetime.now().strftime('%I:%M %p')}\n\n"
-        f"Market opens at <b>9:15 AM</b>. All trades will be alerted here."
+        f"Mode: <b>{mode.upper()}</b>\n"
+        f"Capital: ₹{capital:,}\n"
+        f"Trade mode: {trade_mode.upper()}\n"
+        f"Max open trades: {max_trades}\n"
+        f"Time: {datetime.now().strftime('%d %b %Y %H:%M:%S')}"
     )
-    _send(msg)
-
 
 def alert_test():
     """Send a test message to verify setup. Run this first."""
