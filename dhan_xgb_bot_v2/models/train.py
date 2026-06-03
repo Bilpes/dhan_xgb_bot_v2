@@ -14,7 +14,9 @@ import sys
 import pickle
 import logging
 from pathlib import Path
-
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
+from sklearn.metrics import brier_score_loss
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -79,11 +81,11 @@ PARAMS = dict(
 # Training Config
 # ─────────────────────────────────────────────────────────────
 N_SPLITS            = 5
-PREDICTION_THRESHOLD = 0.72
+PREDICTION_THRESHOLD = 0.95
 
 MIN_ACC    = 0.53
 MIN_AUC    = 0.55
-MIN_PREC   = 0.55
+MIN_PREC   = 0.75
 MIN_TRADES = 50
 
 # ─────────────────────────────────────────────────────────────
@@ -182,69 +184,70 @@ def load_all_stocks() -> tuple[pd.DataFrame, pd.DataFrame]:
 # Predict sustained expansion after entry
 # ─────────────────────────────────────────────────────────────
 def _make_continuation_labels(
-    feat: pd.DataFrame,
-    horizon: int = 6,
-    target_pct: float = 0.012,
-) -> pd.DataFrame:
+        feat: pd.DataFrame,
+        horizon: int = 12,
+        target_pct: float = 0.015,
+    ) -> pd.DataFrame:
 
-    feat = (
-        feat.copy()
-        .sort_values(["symbol", "datetime"])
-        .reset_index(drop=True)
-    )
-
-    all_frames = []
-
-    for sym, g in feat.groupby("symbol", sort=False):
-
-        g = g.reset_index(drop=True)
-
-        # Future highest high within next N candles
-        future_high = pd.concat(
-            [
-                g["high"].shift(-i)
-                for i in range(1, horizon + 1)
-            ],
-            axis=1,
-        ).max(axis=1)
-
-        future_low = pd.concat(
-            [
-                g["low"].shift(-i)
-                for i in range(1, horizon + 1)
-            ],
-            axis=1,
-        ).min(axis=1)
-
-        # Future downside risk
-        future_low = (
-            g["low"]
-            .shift(-1)
-            .rolling(horizon)
-            .min()
+        feat = (
+            feat.copy()
+            .sort_values(["symbol", "datetime"])
+            .reset_index(drop=True)
         )
 
-        # Future expansion %
-        future_upside = (
-            (future_high - g["close"])
-            / (g["close"] + 1e-9)
+        all_frames = []
+
+        for sym, g in feat.groupby("symbol", sort=False):
+
+            g = g.reset_index(drop=True)
+
+            future_high = pd.concat(
+                [
+                    g["high"].shift(-i)
+                    for i in range(1, horizon + 1)
+                ],
+                axis=1,
+            ).max(axis=1)
+
+            future_low = pd.concat(
+                [
+                    g["low"].shift(-i)
+                    for i in range(1, horizon + 1)
+                ],
+                axis=1,
+            ).min(axis=1)
+
+            future_upside = (
+                (future_high - g["close"])
+                / (g["close"] + 1e-9)
+            )
+
+            future_drawdown = (
+                (future_low - g["close"])
+                / (g["close"] + 1e-9)
+            )
+
+            g["target"] = (
+                (future_upside > target_pct)
+                & (future_drawdown > -0.004)
+            ).astype(int)
+
+            g["sample_weight"] = np.where(
+                g["target"] == 1,
+                np.clip(
+                    future_upside / target_pct,
+                    1.0,
+                    3.0,
+                ),
+                1.0,
+            )
+
+            all_frames.append(g)
+
+        return pd.concat(
+            all_frames,
+            ignore_index=True,
         )
-
-        # Future drawdown %
-        future_drawdown = (
-            (future_low - g["close"])
-            / (g["close"] + 1e-9)
-        )
-
-        # Label only strong continuation moves
-        g["target"] = (
-            (future_upside > target_pct)
-            & (future_drawdown > -0.006)
-        ).astype(int)
-
-        all_frames.append(g)
-
-    return pd.concat(all_frames, ignore_index=True)
 # ─────────────────────────────────────────────────────────────
 # Prepare Dataset
 # ─────────────────────────────────────────────────────────────
@@ -291,6 +294,8 @@ def prepare_dataset(
     X = feat[FEATURE_COLS].values.astype(np.float32)
     y = feat["target"].values.astype(int)
 
+    weights = feat["sample_weight"].values.astype(np.float32)
+
     pos_rate = y.mean() * 100
 
     print(
@@ -303,12 +308,12 @@ def prepare_dataset(
         f"HOLD={100 - pos_rate:.1f}%"
     )
 
-    return X, y
+    return X, y,weights
 
 # ─────────────────────────────────────────────────────────────
 # Walk-forward Evaluation
 # ─────────────────────────────────────────────────────────────
-def walk_forward_eval(X, y):
+def walk_forward_eval(X, y,weights):
 
     tscv = TimeSeriesSplit(
     n_splits=N_SPLITS,
@@ -319,6 +324,7 @@ def walk_forward_eval(X, y):
     oos_auc = []
     oos_prec = []
     oos_recall = []
+    oos_brier = []
 
     print(f"\nWalk-forward evaluation ({N_SPLITS} folds)...")
 
@@ -340,7 +346,7 @@ def walk_forward_eval(X, y):
 
         X_tr_s = scaler.fit_transform(X_tr)
         X_te_s = scaler.transform(X_te)
-
+      
         params = {
             **PARAMS,
             "scale_pos_weight": scale_pos_weight,
@@ -350,13 +356,51 @@ def walk_forward_eval(X, y):
 
         model = xgb.XGBClassifier(**params)
 
+        w_tr = weights[tr_idx]
+
         model.fit(
             X_tr_s,
             y_tr,
+            sample_weight=w_tr,
             verbose=False,
         )
 
         y_prob = model.predict_proba(X_te_s)[:, 1]
+        bins = [0.50,0.60,0.70,0.80,0.90,1.00]
+
+        bucket = pd.cut(
+            y_prob,
+            bins=bins,
+            include_lowest=True
+        )
+
+        tmp = pd.DataFrame({
+            "prob": y_prob,
+            "actual": y_te,
+            "bucket": bucket,
+        })
+
+        cal = tmp.groupby("bucket").agg(
+            predicted=("prob","mean"),
+            actual=("actual","mean"),
+            count=("actual","size"),
+        )
+        
+        high_conf = tmp[tmp["prob"] >= 0.90]
+        print(
+    ">=0.90",
+    "count=", len(high_conf),
+    "winrate=", high_conf["actual"].mean()
+)
+
+        print(cal)
+        brier = brier_score_loss(y_te, y_prob)
+        oos_brier.append(brier)
+
+        print(
+            f"Fold {fold}: "
+            f"Brier={brier:.4f}"
+        )
 
         # Higher confidence threshold
         y_pred = (
@@ -411,16 +455,17 @@ def walk_forward_eval(X, y):
         "auc": np.mean(oos_auc),
         "prec": np.mean(oos_prec),
         "recall": np.mean(oos_recall),
+        "brier": np.mean(oos_brier),
     }
 
 # ─────────────────────────────────────────────────────────────
 # Final Training
 # ─────────────────────────────────────────────────────────────
-def train_final(X, y):
+def train_final(X, y,weights):
 
     # STRICT time split
     split = int(len(X) * 0.80)
-
+    w_tr = weights[:split]
     X_tr = X[:split]
     X_val = X[split:]
 
@@ -448,14 +493,42 @@ def train_final(X, y):
     model.fit(
         X_tr_s,
         y_tr,
+        sample_weight=w_tr,
         eval_set=[(X_val_s, y_val)],
         verbose=50,
     )
 
+    # Freeze trained XGBoost model
+    frozen_model = FrozenEstimator(model)
+
+    # Probability calibration
+    calibrated_model = CalibratedClassifierCV(
+        estimator=frozen_model,
+        method="isotonic",
+    )
+
+    calibrated_model.fit(
+        X_val_s,
+        y_val,
+    )
+
+    model = calibrated_model
+
     # ── Feature importance ────────────────────────────────
+    base_model = model.estimator
+    
+    base_model = getattr(
+        model,
+        "estimator",
+        None
+    )
+
+    if base_model is None:
+        base_model = model
+
     imp = pd.DataFrame({
         "feature": FEATURE_COLS,
-        "importance": model.feature_importances_,
+        "importance": base_model.feature_importances_,
     })
 
     imp = imp.sort_values(
@@ -515,22 +588,24 @@ if __name__ == "__main__":
     stock_df, nifty_df = load_all_stocks()
 
     # 2. Build dataset
-    X, y = prepare_dataset(
+    X, y,weights  = prepare_dataset(
         stock_df,
         nifty_df,
     )
 
     # 3. Walk-forward evaluation
-    metrics = walk_forward_eval(X, y)
+    metrics = walk_forward_eval(X, y, weights)
 
     print(
         f"\nOOS Summary → "
         f"acc={metrics['acc']:.3f} | "
         f"AUC={metrics['auc']:.3f} | "
         f"prec={metrics['prec']:.3f} | "
-        f"recall={metrics['recall']:.3f}"
+        f"recall={metrics['recall']:.3f} |"
+        f"Brier={metrics['brier']:.4f}"
     )
-
+    bins = [0.5,0.6,0.7,0.8,0.9,1.0]
+   
     # 4. Deployment gate
     gate_passed = deployment_gate(
         metrics,
@@ -541,7 +616,7 @@ if __name__ == "__main__":
 
         print("\nTraining final model...")
 
-        model, scaler = train_final(X, y)
+        model, scaler = train_final(X, y, weights)
 
         # ── Save deployment package ───────────────────────
         model_package = {

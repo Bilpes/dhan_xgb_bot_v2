@@ -36,7 +36,7 @@ ATR_PERIOD  = 14
 # Entry filters
 # ─────────────────────────────────────────────────────────────
 
-BUY_THRESHOLD_DEFAULT = 0.65
+BUY_THRESHOLD_DEFAULT = 0.72
 
 # Minimum reward:risk required
 MIN_RR_RATIO = 2.0
@@ -51,14 +51,14 @@ EXIT_LONG_THRESHOLD  = 0.56
 EXIT_SHORT_THRESHOLD = 0.60
 
 # Weakening regime
-WEAK_THRESHOLD    = 0.64            
-WEAK_CANDLES_MAX  = 3
+WEAK_THRESHOLD    = 0.60            
+WEAK_CANDLES_MAX  = 5
 
 # Momentum failure exit
 # Good trades should work quickly.
 # Exit if still negative after N completed candles.
 
-MOMENTUM_EXIT_CANDLES = 6
+MOMENTUM_EXIT_CANDLES = 14
 
 
 # ─────────────────────────────────────────────────────────────

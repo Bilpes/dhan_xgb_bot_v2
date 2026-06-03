@@ -15,12 +15,22 @@
 #
 # Fix log (2026-05-14):
 #   FIX-2: market_regime now uses entry_prob (immutable), not last_prob
-#   FIX-3: momentum exit raised to 8 candles (40 min) for CNC mode
+#   FIX-3: momentum exit min candles = 14 (70 min) for CNC mode
 #   FIX-4: circuit breaker Telegram alert fires only once per halt
 #   FIX-5: _should_rotate() uses fresh engine.score() for last_prob
 #   FIX-6: _force_exit_all() fallback uses entry price, not running_high
 #   FIX-7: _is_candle_boundary() de-duplicated per candle via key guard
 #          KeyboardInterrupt now calls _force_exit_all() in live mode
+#
+# Fix log (2026-05-25):
+#   BUG-A: df.empty guard moved BEFORE EMA calculation in _scan_and_enter
+#          (previously crashed with AttributeError on empty DataFrame)
+#   BUG-B: eod_reset used self.circuitalertsent instead of self._circuit_alert_sent
+#          (circuit breaker would never reset between trading days)
+#   BUG-C: eod_reset used self.last_boundary_key instead of self._last_boundary_key
+#          (candle boundary dedup key would never reset between days)
+#   BUG-D: momentum failure exit used hardcoded 14 instead of
+#          self._MOMENTUM_EXIT_MIN_CANDLES (class constant was ignored)
 # ============================================================
 
 from __future__ import annotations
@@ -34,7 +44,7 @@ from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
 from collections import defaultdict
-
+from bot.trade_policy import MOMENTUM_EXIT_CANDLES
 load_dotenv(dotenv_path=os.path.join("config", ".env"))
 
 # ── Mode validation (fail-fast before any imports) ───────────
@@ -66,7 +76,7 @@ MAX_PER_SECTOR          = int(os.getenv("MAX_PER_SECTOR",           "2"))
 NEW_TRADE_LOSS_PAUSE    = float(os.getenv("NEW_TRADE_LOSS_PAUSE",   "-0.03"))
 NIFTY50_SECURITY_ID     = os.getenv("NIFTY50_SECURITY_ID",          "13")
 MONITOR_INTERVAL        = int(os.getenv("MONITOR_INTERVAL",         "60"))
-SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL",            "300"))
+SCAN_INTERVAL           = int(os.getenv("SCAN_INTERVAL",            "30"))
 AUTO_EXIT_TIME          = os.getenv("AUTO_EXIT_TIME",               "15:15")
 AUTO_EXIT_THRESHOLD     = float(os.getenv("AUTO_EXIT_THRESHOLD",    "-0.01"))
 EOD_RESET_TIME          = os.getenv("EOD_RESET_TIME",               "15:30")
@@ -299,9 +309,9 @@ class LiveBot:
 
     # FIX-3: Minimum candles before momentum-failure exit is evaluated.
     # CNC delivery trades need time to develop — 15 min (3 candles) is
-    # statistical noise on a large-cap NSE stock. 8 candles = 40 minutes
+    # statistical noise on a large-cap NSE stock. 14 candles = 70 minutes
     # is a more appropriate minimum for post-breakout continuation checks.
-    _MOMENTUM_EXIT_MIN_CANDLES = 8
+    _MOMENTUM_EXIT_MIN_CANDLES = MOMENTUM_EXIT_CANDLES
 
     def __init__(self):
         self.broker  = DhanBroker()
@@ -775,15 +785,19 @@ class LiveBot:
             if sector_count >= MAX_PER_SECTOR:
                 continue
 
+            # BUG-A FIX: guard df.empty BEFORE accessing df columns for EMA.
+            # Previously ema20/ema50 were computed before the empty check,
+            # causing AttributeError when broker returned an empty DataFrame.
             df = self.broker.get_candles(sec_id, symbol, days_back=10)
+            if df.empty:
+                continue
+
             ema20 = df["close"].ewm(span=20).mean().iloc[-1]
             ema50 = df["close"].ewm(span=50).mean().iloc[-1]
 
             # Only trade aligned trends
-            if ema20 <= ema50:
-                continue
-            if df.empty:
-                continue
+            #if ema20 <= ema50:
+            #    continue
 
             result = self.engine.score(df, symbol=symbol)
             if result["signal"] != "BUY":
@@ -801,9 +815,6 @@ class LiveBot:
                             if symbol not in self.rejection_symbols[r]:
                                 self.rejection_symbols[r].append(symbol)
                 continue
-
-            # ── Additional quality gate ─────────────────
-            # Avoid mediocre continuation setups
 
             entry  = result["entry"]
             sl     = result["sl"]
@@ -1205,16 +1216,13 @@ class LiveBot:
 
                 trade.candles_held += 1
 
-                # ── FIX-3: Momentum failure exit ─────────────
-                # Raised from 3 candles (15 min) to _MOMENTUM_EXIT_MIN_CANDLES
-                # (8 candles = 40 min) for CNC delivery trades.
-                # Rationale: Nifty 50 large-caps routinely consolidate
-                # for 20-35 minutes post-breakout before continuation.
-                # Exiting at 15 min was systematically cutting correct
-                # trades during their normal consolidation phase.
-                # ── Momentum failure exit ─────────────────────
+                # ── FIX-3 / BUG-D: Momentum failure exit ─────────────
+                # Uses self._MOMENTUM_EXIT_MIN_CANDLES (14 candles = 70 min).
+                # Previously the class constant was defined but never used —
+                # the check was hardcoded to 14 directly, meaning any change
+                # to the constant had no effect. Now references the constant.
                 if (
-                    trade.candles_held >= 14
+                    trade.candles_held >= self._MOMENTUM_EXIT_MIN_CANDLES
                     and pnl < -(trade.atr * trade.qty * 0.30)
                     and trade.last_prob < 0.45
                 ):
@@ -1229,26 +1237,8 @@ class LiveBot:
                     continue
 
                 # ── 4. Candle-low SL check ─────────────────
-                # DISABLED:
-                # Candle lows create many false stop exits
+                # DISABLED: candle lows create many false stop exits
                 # due to wick noise and broker candle artifacts.
-                # try:
-                #     df_check = self.broker.get_candles(
-                #         trade.security_id, symbol, days_back=1,
-                #     )
-                #     if not df_check.empty:
-                #         last_low = float(df_check["low"].iloc[-1])
-                #         if last_low <= trade.stop_loss:
-                #             log.warning(
-                #                 "%s: SL HIT (candle low) "
-                #                 "low=%.2f ≤ SL=%.2f held=%.0fmin",
-                #                 symbol, last_low, trade.stop_loss, hold_mins,
-                #             )
-                #             self._exit_trade(trade, trade.stop_loss, "SL_HIT_CANDLE_LOW")
-                #             self.sl_blacklist.add(symbol)
-                #             continue
-                # except Exception as e:
-                #     log.warning("%s: candle-low SL check error: %s", symbol, e)
 
                 # ── 5. Auto-exit: 2:45 PM weak market ─────
                 if (
@@ -1318,8 +1308,6 @@ class LiveBot:
             ltp = prices.get(str(trade.security_id), 0.0)
             if ltp <= 0:
                 # FIX-6: Use entry price as conservative fallback.
-                # running_high was used before — that inflated paper P&L
-                # when positions were in loss at EOD.
                 ltp = trade.entry
                 log.warning(
                     "%s: LTP unavailable — conservative fallback exit at entry=%.2f",
@@ -1390,9 +1378,6 @@ class LiveBot:
         })
 
         # ── Quant analytics log ─────────────────────────────
-        # FIX-1 (already applied by user): slippage is now the
-        # difference between exit_price and the intended limit price,
-        # not the gross price move from entry.
         slippage = abs(exit_price - trade.target)      if reason == "TARGET_HIT" \
               else abs(exit_price - trade.stop_loss)   if "SL" in reason \
               else 0.0
@@ -1401,8 +1386,6 @@ class LiveBot:
 
         # FIX-2: Use entry_prob (immutable snapshot at trade open),
         # NOT last_prob (which reflects model state at exit time).
-        # last_prob may have decayed significantly after entry —
-        # classifying regime at exit would mislabel bull entries as WEAK.
         market_regime = (
             "BULL"     if trade.entry_prob >= 0.70
             else "SIDEWAYS" if trade.entry_prob >= 0.55
@@ -1462,7 +1445,6 @@ class LiveBot:
                 round(slippage, 2),
                 trade_duration,
                 market_regime,
-   
                 reason,
             ])
 
@@ -1499,10 +1481,10 @@ class LiveBot:
         self.rejection_symbols.clear()
 
         self.sl_blacklist.clear()
-        self.circuitalertsent = False
+        self._circuit_alert_sent = False          # BUG-B FIX: was self.circuitalertsent
         self.risk.reset_daily()
         self.closed_trades.clear()
-        self.last_boundary_key = None
+        self._last_boundary_key = None            # BUG-C FIX: was self.last_boundary_key
         log.info("EOD reset complete.")
 
     # ──────────────────────────────────────────────────────────
@@ -1523,7 +1505,7 @@ class LiveBot:
 
         FIX-4: Circuit breaker Telegram alert fires ONCE per halt,
         not on every monitor tick. _circuit_alert_sent flag is reset
-        in _eod_reset() so it fires again next trading day.
+        in eod_reset() so it fires again next trading day.
         """
         log.info("=" * 60)
         log.info("LiveBot starting — mode: %s", MODE_LABEL.get(BOT_MODE, BOT_MODE).upper())
@@ -1580,7 +1562,7 @@ class LiveBot:
                             "(daily loss limit or consecutive SL limit breached). "
                             "Resuming tomorrow after EOD reset."
                         )
-                        alert_circuit_breaker(self.risk.daily_pnl)
+                        alert_circuit_breaker(self.risk.daily_pnl,CAPITAL)
                         self._circuit_alert_sent = True
                     # Still monitor existing positions even when halted —
                     # we just block new entries (handled in _scan_and_enter).
