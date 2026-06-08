@@ -357,11 +357,8 @@ def retrain():
     feat = feat.dropna(subset=FEATURE_COLS + ["target"]).reset_index(drop=True)
 
     X = feat[FEATURE_COLS].values.astype(np.float32)
-    #y = feat["target"].values.astype(int)
-    np.random.seed(42)
-    print("RANDOM LABEL TEST ACTIVE")
-    y = np.random.randint(0, 2, size=len(feat))
-    
+    y = feat["target"].values.astype(int)
+
     pos_rate = y.mean() * 100
     log.info("Dataset: %d rows | BUY=%.1f%%  HOLD=%.1f%%", len(X), pos_rate, 100 - pos_rate)
 

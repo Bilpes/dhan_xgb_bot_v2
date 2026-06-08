@@ -18,7 +18,7 @@
 
 #TP_PCT   = 0.025    # 2.5% target
 #SL_PCT   = 0.010    # 1.0% stop
-HORIZON  = 24       # 24 x 5m candles ≈ 2 trading hours
+HORIZON  = 12       # 24 x 5m candles ≈ 2 trading hours
 
 
 # ─────────────────────────────────────────────────────────────
@@ -36,10 +36,10 @@ ATR_PERIOD  = 14
 # Entry filters
 # ─────────────────────────────────────────────────────────────
 
-BUY_THRESHOLD_DEFAULT = 0.72
+BUY_THRESHOLD_DEFAULT = 0.60
 
 # Minimum reward:risk required
-MIN_RR_RATIO = 2.0
+MIN_RR_RATIO = 1.4
 
 
 # ─────────────────────────────────────────────────────────────

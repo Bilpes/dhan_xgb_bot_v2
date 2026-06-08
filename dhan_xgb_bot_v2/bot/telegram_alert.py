@@ -56,44 +56,59 @@ def _send(message: str):
 
 # ── Alert types ──────────────────────────────────────────────
 
-def alert_entry(symbol: str, buy_price: float, stop_loss: float,
-                target: float, quantity: int, prob_up: float,
-                trade_mode: str, invested: float):
-    """
-    Sent when bot places a BUY order.
+from datetime import datetime
 
-    Example message:
-    ────────────────────────
-    🟢 BUY ORDER PLACED
-    ────────────────────────
-    🏢 Company   : HDFCBANK
-    📈 Buy price : ₹1,723.50
-    🎯 Target    : ₹1,810.00
-    🛑 Stop-loss : ₹1,681.00
-    📦 Quantity  : 52 shares
-    💰 Invested  : ₹89,622
-    📊 Confidence: 67.3%
-    🕐 Mode      : INTRADAY
-    ⏰ Time      : 09:32 AM
+
+def alert_entry(
+    symbol: str,
+    buy_price: float,
+    stop_loss: float,
+    target: float,
+    quantity: int,
+    prob_up: float,
+    trade_mode: str,
+    invested: float,
+):
     """
+    Telegram BUY alert.
+    """
+
     time_str = datetime.now().strftime("%I:%M %p")
-    mode_str = "INTRADAY" if trade_mode == "intraday" else "SWING (1-2 days)"
+
+    rr = (
+        (target - buy_price)
+        / max(buy_price - stop_loss, 0.01)
+    )
+
+    risk_pct = (
+        abs(buy_price - stop_loss)
+        / buy_price
+    ) * 100
+
+    mode_str = (
+        "INTRADAY"
+        if trade_mode.lower() == "intraday"
+        else "SWING"
+    )
 
     msg = (
         f"🟢 <b>BUY ORDER PLACED</b>\n"
-        f"{'─' * 28}\n"
-        f"🏢 <b>Company</b>    : <b>{symbol}</b>\n"
-        f"📈 <b>Buy price</b>  : ₹{buy_price:,.2f}\n"
-        f"🎯 <b>Target</b>     : ₹{target:,.2f}\n"
-        f"🛑 <b>Stop-loss</b>  : ₹{stop_loss:,.2f}\n"
-        f"📦 <b>Quantity</b>   : {quantity} shares\n"
-        f"💰 <b>Invested</b>   : ₹{invested:,.0f}\n"
-        f"📊 <b>Confidence</b> : {prob_up*100:.1f}%\n"
-        f"🕐 <b>Mode</b>       : {mode_str}\n"
-        f"⏰ <b>Time</b>       : {time_str}"
+        f"{'─' * 30}\n"
+        f"🏢 <b>Company</b>      : <b>{symbol}</b>\n"
+        f"📈 <b>Buy Price</b>    : ₹{buy_price:,.2f}\n"
+        f"🎯 <b>Target</b>       : ₹{target:,.2f}\n"
+        f"🛑 <b>Stop Loss</b>    : ₹{stop_loss:,.2f}\n"
+        f"📦 <b>Quantity</b>     : {quantity:,} shares\n"
+        f"💰 <b>Invested</b>     : ₹{invested:,.0f}\n"
+        f"⚖️ <b>Risk/Reward</b>  : {rr:.2f}\n"
+        f"📏 <b>Risk</b>         : {risk_pct:.2f}%\n"
+        f"🤖 <b>Model Score</b>  : {prob_up:.3f}\n"
+        f"📊 <b>Confidence</b>   : {prob_up*100:.1f}%\n"
+        f"🕐 <b>Mode</b>         : {mode_str}\n"
+        f"⏰ <b>Time</b>         : {time_str}"
     )
-    _send(msg)
 
+    _send(msg)
 
 def alert_exit(symbol: str, buy_price: float, sell_price: float,
                quantity: int, pnl: float, reason: str, trade_mode: str):

@@ -1,8 +1,7 @@
 # ============================================================
 # data/features.py — Build XGBoost features from OHLCV
-# PhD-grade feature engineering for NSE 5-min time series
-# Zero lookahead leakage. Works for both single-stock and
-# multi-stock DataFrames.
+# Cleaned version: no target generation inside feature builder,
+# single timing convention, safer Nifty alignment.
 # ============================================================
 import pandas as pd
 import numpy as np
@@ -14,9 +13,9 @@ def _ema(series, n):
 
 def _rsi(close, n=14):
     delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(n).mean().shift(1)
-    loss  = (-delta.clip(upper=0)).rolling(n).mean().shift(1)
-    rs    = gain / (loss + 1e-9)
+    gain = delta.clip(lower=0).rolling(n).mean()
+    loss = (-delta.clip(upper=0)).rolling(n).mean()
+    rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
 
@@ -24,52 +23,47 @@ def _atr(high, low, close, n=14):
     tr = pd.concat([
         high - low,
         (high - close.shift(1)).abs(),
-        (low  - close.shift(1)).abs()
+        (low - close.shift(1)).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(n).mean().shift(1)
+    return tr.rolling(n).mean()
 
 
 def _vwap_intraday(group):
-    tp  = (group["high"] + group["low"] + group["close"]) / 3.0
+    tp = (group["high"] + group["low"] + group["close"]) / 3.0
     vol = group["volume"].astype(float)
     return (tp * vol).cumsum() / (vol.cumsum() + 1e-9)
 
 
 def _macd(close, fast=12, slow=26, signal=9):
-    macd_line = (
-        _ema(close, fast).shift(1)
-        - _ema(close, slow).shift(1)
-    )
-
-    signal_line = _ema(macd_line, signal).shift(1)
-
+    macd_line = _ema(close, fast) - _ema(close, slow)
+    signal_line = _ema(macd_line, signal)
     return macd_line, signal_line
 
 
 def _bollinger(close, n=20, k=2):
-    mid = close.rolling(n).mean().shift(1)
-    std = close.rolling(n).std().shift(1)
+    mid = close.rolling(n).mean()
+    std = close.rolling(n).std()
     return mid + k * std, mid - k * std
 
 
 def _stoch(high, low, close, k=14, d=3):
-    lowest  = low.rolling(k).min().shift(1)
-    highest = high.rolling(k).max().shift(1)
-    pct_k   = 100 * (close - lowest) / (highest - lowest + 1e-9)
-    pct_d   = pct_k.rolling(d).mean().shift(1)
+    lowest = low.rolling(k).min()
+    highest = high.rolling(k).max()
+    pct_k = 100 * (close - lowest) / (highest - lowest + 1e-9)
+    pct_d = pct_k.rolling(d).mean()
     return pct_k, pct_d
 
 
 def _cci(high, low, close, n=20):
-    tp  = (high + low + close) / 3.0
-    ma  = tp.rolling(n).mean().shift(1)
-    mad = (tp.rolling(n).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True).shift(1))
+    tp = (high + low + close) / 3.0
+    ma = tp.rolling(n).mean()
+    mad = tp.rolling(n).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
     return (tp - ma) / (0.015 * mad + 1e-9)
 
 
 def _williams_r(high, low, close, n=14):
-    hh = high.rolling(n).max().shift(1)
-    ll = low.rolling(n).min().shift(1)
+    hh = high.rolling(n).max()
+    ll = low.rolling(n).min()
     return -100 * (hh - close) / (hh - ll + 1e-9)
 
 
@@ -91,376 +85,196 @@ def _build_symbol_features(g: pd.DataFrame) -> pd.DataFrame:
     c = g["close"].astype(float)
     v = g["volume"].astype(float)
 
-    # ── Trend EMAs ───────────────────────────────────────────
-    g["ema_9"]   = _ema(c, 9)
-    g["ema_20"]  = _ema(c, 20)
-    g["ema_21"]  = _ema(c, 21)
-    g["ema_50"]  = _ema(c, 50)
+    g["ema_9"] = _ema(c, 9)
+    g["ema_20"] = _ema(c, 20)
+    g["ema_21"] = _ema(c, 21)
+    g["ema_50"] = _ema(c, 50)
     g["ema_200"] = _ema(c, 200)
 
-    g["ema_cross"]    = g["ema_9"] - g["ema_21"]
+    g["ema_cross"] = g["ema_9"] - g["ema_21"]
     g["ema_cross_50"] = g["ema_21"] - g["ema_50"]
-    # ── EMA acceleration ───────────────────────────────────────
-    g["ema_spread"] = (
-        g["ema_9"] - g["ema_20"]
-    )
-
-    g["ema_spread_velocity"] = (
-        g["ema_spread"].diff(3)
-    )
-    g["price_vs_ema9"]  = (c - g["ema_9"]) / (g["ema_9"] + 1e-9)
+    g["ema_spread"] = g["ema_9"] - g["ema_20"]
+    g["ema_spread_velocity"] = g["ema_spread"].diff(3)
+    g["price_vs_ema9"] = (c - g["ema_9"]) / (g["ema_9"] + 1e-9)
     g["price_vs_ema21"] = (c - g["ema_21"]) / (g["ema_21"] + 1e-9)
     g["price_vs_ema50"] = (c - g["ema_50"]) / (g["ema_50"] + 1e-9)
 
-    # ── Momentum ─────────────────────────────────────────────
     g["rsi_14"] = _rsi(c, 14)
-    g["rsi_7"]  = _rsi(c, 7)
+    g["rsi_7"] = _rsi(c, 7)
     g["rsi_21"] = _rsi(c, 21)
-
     g["rsi_slope"] = g["rsi_14"].diff(3)
 
     macd, sig = _macd(c)
-
-    g["macd"]            = macd
-    g["macd_signal"]     = sig
-    g["macd_hist"]       = macd - sig
+    g["macd"] = macd
+    g["macd_signal"] = sig
+    g["macd_hist"] = macd - sig
     g["macd_hist_slope"] = g["macd_hist"].diff(2)
 
     g["stoch_k"], g["stoch_d"] = _stoch(h, l, c)
     g["stoch_cross"] = g["stoch_k"] - g["stoch_d"]
 
-    g["roc_3"]  = c.pct_change(3)
-    g["roc_5"]  = c.pct_change(5)
+    g["roc_3"] = c.pct_change(3)
+    g["roc_5"] = c.pct_change(5)
     g["roc_10"] = c.pct_change(10)
     g["roc_20"] = c.pct_change(20)
 
-    g["cci_20"]   = _cci(h, l, c, 20)
+    g["cci_20"] = _cci(h, l, c, 20)
     g["willr_14"] = _williams_r(h, l, c, 14)
 
-    # ── Volatility ───────────────────────────────────────────
     g["atr_14"] = _atr(h, l, c, 14)
+    g["atr_pct"] = g["atr_14"] / (c + 1e-9)
+    g["atr_ratio"] = g["atr_14"] / (g["atr_14"].rolling(20).mean() + 1e-9)
 
-    g["atr_pct"] = (
-        g["atr_14"] / (c + 1e-9)
-    )
-
-    g["atr_ratio"] = (
-        g["atr_14"]
-        / (g["atr_14"].rolling(20).mean() + 1e-9)
-    )
-    
-    # ── Range expansion (momentum ignition) ───────────────────
     g["range"] = h - l
-
-    g["range_expansion"] = (
-        g["range"]
-        / (g["range"].rolling(10).mean() + 1e-9)
-    )
+    g["range_expansion"] = g["range"] / (g["range"].rolling(10).mean() + 1e-9)
 
     bb_up, bb_lo = _bollinger(c)
-
-    g["bb_width"] = (
-        (bb_up - bb_lo) / (c + 1e-9)
-    )
-
-    g["bb_position"] = (
-        (c - bb_lo)
-        / (bb_up - bb_lo + 1e-9)
-    )
-
+    g["bb_width"] = (bb_up - bb_lo) / (c + 1e-9)
+    g["bb_position"] = (c - bb_lo) / (bb_up - bb_lo + 1e-9)
     g["bb_squeeze"] = (
-        g["bb_width"]
-        < g["bb_width"]
-            .rolling(20)
-            .quantile(0.20)
-            .shift(1)
+        g["bb_width"] < g["bb_width"].rolling(20).quantile(0.20)
     ).astype(int)
 
     kc_up, kc_lo = _keltner_channels(h, l, c)
+    g["kc_position"] = (c - kc_lo) / (kc_up - kc_lo + 1e-9)
 
-    g["kc_position"] = (
-        (c - kc_lo)
-        / (kc_up - kc_lo + 1e-9)
-    )
+    g["hvol_20"] = c.pct_change().rolling(20).std() * np.sqrt(75 * 252)
 
-    g["hvol_20"] = (
-        c.pct_change()
-         .rolling(20)
-         .std()
-         * np.sqrt(75 * 252)
-    )
-
-    # ── Volume / VWAP ────────────────────────────────────────
     g["vol_ma20"] = v.rolling(20).mean()
-
-    g["vol_ratio"] = (
-        v / (g["vol_ma20"] + 1e-9)
-    )
-    # ── Volume acceleration ────────────────────────────────────
-    g["vol_acceleration"] = (
-        g["vol_ratio"].diff(3)
-    )
-    g["vol_spike"] = (
-        g["vol_ratio"] > 2.0
-    ).astype(int)
+    g["vol_ratio"] = v / (g["vol_ma20"] + 1e-9)
+    g["vol_acceleration"] = g["vol_ratio"].diff(3)
+    g["vol_spike"] = (g["vol_ratio"] > 2.0).astype(int)
 
     g["trade_date"] = g["datetime"].dt.normalize()
-
     g["vwap"] = (
         g.groupby("trade_date", group_keys=False)
-         .apply(_vwap_intraday)
-         .reset_index(level=0, drop=True)
+        .apply(_vwap_intraday)
+        .reset_index(level=0, drop=True)
     )
+    g["price_vs_vwap"] = (c - g["vwap"]) / (g["vwap"] + 1e-9)
+    g["vwap_slope"] = g["vwap"].diff(5) / (g["vwap"].shift(5) + 1e-9)
+    g["vwm_5"] = ((c.pct_change(1) * v).rolling(5).sum() / (v.rolling(5).sum() + 1e-9))
+    g["vwm_10"] = ((c.pct_change(1) * v).rolling(10).sum() / (v.rolling(10).sum() + 1e-9))
 
-    g["price_vs_vwap"] = (
-        (c - g["vwap"])
-        / (g["vwap"] + 1e-9)
-    )
+    g["hl_range"] = (h - l) / (c + 1e-9)
+    g["body"] = (c - o) / (h - l + 1e-9)
+    g["upper_wick"] = (h - pd.concat([o, c], axis=1).max(axis=1)) / (h - l + 1e-9)
+    g["lower_wick"] = (pd.concat([o, c], axis=1).min(axis=1) - l) / (h - l + 1e-9)
+    g["gap"] = (o - c.shift(1)) / (c.shift(1) + 1e-9)
+    g["doji"] = (g["body"].abs() < 0.1).astype(int)
+    g["hammer"] = ((g["lower_wick"] > 0.6) & (g["body"] > 0)).astype(int)
+    g["shooting_star"] = ((g["upper_wick"] > 0.6) & (g["body"] < 0)).astype(int)
+    g["candle_body_pct"] = (c - o).abs() / (c + 1e-9)
+    g["strong_bull_candle"] = ((c > o) & (g["body"] > 0.5) & (g["candle_body_pct"] > 0.003)).astype(int)
+    g["close_position_in_range"] = (c - l) / ((h - l) + 1e-9)
 
-    g["vwap_slope"] = (
-        g["vwap"].diff(5)
-        / (g["vwap"].shift(5) + 1e-9)
-    )
-
-    g["vwm_5"] = (
-        (c.pct_change(1) * v).rolling(5).sum()
-        / (v.rolling(5).sum() + 1e-9)
-    )
-
-    g["vwm_10"] = (
-        (c.pct_change(1) * v).rolling(10).sum()
-        / (v.rolling(10).sum() + 1e-9)
-    )
-
-    # ── Price structure / candle anatomy ────────────────────
-    g["hl_range"] = (
-        (h - l) / (c + 1e-9)
-    )
-
-    g["body"] = (
-        (c - o) / (h - l + 1e-9)
-    )
-
-    g["upper_wick"] = (
-        (h - pd.concat([o, c], axis=1).max(axis=1))
-        / (h - l + 1e-9)
-    )
-
-    g["lower_wick"] = (
-        (pd.concat([o, c], axis=1).min(axis=1) - l)
-        / (h - l + 1e-9)
-    )
-
-    g["gap"] = (
-        (o - c.shift(1))
-        / (c.shift(1) + 1e-9)
-    )
-
-    g["doji"] = (
-        g["body"].abs() < 0.1
-    ).astype(int)
-
-    g["hammer"] = (
-        (g["lower_wick"] > 0.6)
-        & (g["body"] > 0)
-    ).astype(int)
-
-    g["shooting_star"] = (
-        (g["upper_wick"] > 0.6)
-        & (g["body"] < 0)
-    ).astype(int)
-
-    # ── Candle quality ───────────────────────────────────────
-    g["candle_body_pct"] = (
-        (c - o).abs()
-        / (c + 1e-9)
-    )
-
-    g["strong_bull_candle"] = (
-        (c > o)
-        & (g["body"] > 0.5)
-        & (g["candle_body_pct"] > 0.003)
-    ).astype(int)
-    # ── Candle closing pressure ────────────────────────────────
-    g["close_position_in_range"] = (
-        (c - l)
-        / ((h - l) + 1e-9)
-    )
-    # ── Lagged returns ───────────────────────────────────────
     for lag in [1, 2, 3, 5, 8, 13]:
         g[f"ret_lag{lag}"] = c.pct_change(lag)
 
-    # ── Autocorrelation regime ───────────────────────────────
     g["autocorr_5"] = (
-        c.pct_change()
-         .rolling(10)
-         .apply(
-             lambda x: pd.Series(x).autocorr(lag=5)
-             if len(x) >= 6 else 0.0,
-             raw=False
-         )
-         .fillna(0.0)
+        c.pct_change().rolling(10).apply(
+            lambda x: pd.Series(x).autocorr(lag=5) if len(x) >= 6 else 0.0,
+            raw=False,
+        ).fillna(0.0)
     )
 
-    # ── Breakout / support-resistance ────────────────────────
-    g["high_20"] = (
-        h.rolling(20).max().shift(1)
-    )
+    g["high_20"] = h.rolling(20).max()
+    g["low_20"] = l.rolling(20).min()
+    g["high_50"] = h.rolling(50).max()
+    g["low_50"] = l.rolling(50).min()
+    g["near_high20"] = (c - g["high_20"]) / (g["high_20"] + 1e-9)
+    g["near_low20"] = (c - g["low_20"]) / (g["low_20"] + 1e-9)
+    g["near_high50"] = (c - g["high_50"]) / (g["high_50"] + 1e-9)
+    g["range_pct_20"] = (g["high_20"] - g["low_20"]) / (c + 1e-9)
 
-    g["low_20"] = (
-        l.rolling(20).min().shift(1)
-    )
+    g["day_high"] = h.groupby(g["trade_date"]).cummax()
+    g["distance_from_day_high"] = (g["day_high"] - c) / (g["atr_14"] + 1e-9)
+    g["prev_5_high"] = h.rolling(5).max().shift(1)
+    g["breakout_confirm"] = (c > (g["prev_5_high"] * 1.003)).astype(int)
 
-    g["high_50"] = (
-        h.rolling(50).max().shift(1)
-    )
+    g["dist_from_ema20"] = (c - g["ema_20"]).abs() / (g["ema_20"] + 1e-9)
+    g["dist_from_vwap"] = (c - g["vwap"]).abs() / (g["vwap"] + 1e-9)
 
-    g["low_50"] = (
-        l.rolling(50).min().shift(1)
-    )
-
-    g["near_high20"] = (
-        (c - g["high_20"])
-        / (g["high_20"] + 1e-9)
-    )
-
-    g["near_low20"] = (
-        (c - g["low_20"])
-        / (g["low_20"] + 1e-9)
-    )
-
-    g["near_high50"] = (
-        (c - g["high_50"])
-        / (g["high_50"] + 1e-9)
-    )
-
-    g["range_pct_20"] = (
-        (g["high_20"] - g["low_20"])
-        / (c + 1e-9)
-    )
-    # ── Intraday strength persistence ──────────────────────────
-    g["day_high"] = (
-        h.groupby(g["trade_date"]).cummax()
-    )
-
-    g["distance_from_day_high"] = (
-        (g["day_high"] - c)
-        / (g["atr_14"] + 1e-9)
-    )
-    # ── Breakout confirmation ────────────────────────────────
-    g["prev_5_high"] = (
-        h.rolling(5)
-         .max()
-         .shift(1)
-    )
-
-    g["breakout_confirm"] = (
-        c > (g["prev_5_high"] * 1.003)
-    ).astype(int)
-
-    # ── Extension filters ────────────────────────────────────
-    g["dist_from_ema20"] = (
-        (c - g["ema_20"]).abs()
-        / (g["ema_20"] + 1e-9)
-    )
-
-    g["dist_from_vwap"] = (
-        (c - g["vwap"]).abs()
-        / (g["vwap"] + 1e-9)
-    )
-
-    # ── Time-of-day effects ──────────────────────────────────
     g["hour"] = g["datetime"].dt.hour
     g["minute"] = g["datetime"].dt.minute
+    g["mins_since_open"] = (g["hour"] - 9) * 60 + g["minute"] - 15
+    g["is_first_30min"] = (g["mins_since_open"] <= 30).astype(int)
+    g["is_last_30min"] = (g["mins_since_open"] >= 330).astype(int)
+    g["session_frac"] = (g["mins_since_open"] / 375.0).clip(0, 1)
 
-    g["mins_since_open"] = (
-        (g["hour"] - 9) * 60
-        + g["minute"] - 15
+    g["trend_strength"] = ((g["ema_20"] > g["ema_50"]) & (c > g["vwap"])).astype(int)
+    trend_score = (g["ema_20"] - g["ema_50"]).abs() / (c + 1e-9)
+    trend_mean = trend_score.rolling(20).mean()
+    g["is_trending"] = (trend_score > trend_mean).astype(int)
+
+    g["day_of_week"] = g["datetime"].dt.dayofweek
+    g["is_monday"] = (g["day_of_week"] == 0).astype(int)
+    g["is_friday"] = (g["day_of_week"] == 4).astype(int)
+    g["above_vwap"] = (c > g["vwap"]).astype(int)
+
+    return g.drop(columns=["trade_date"], errors="ignore")
+
+
+def _build_nifty_block(feat: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
+    if nifty_df is None or nifty_df.empty:
+        out = pd.DataFrame(index=feat.index)
+        for col in _NIFTY_COLS:
+            out[col] = 0.0
+        return out
+
+    nifty = nifty_df.copy()
+    if "datetime" in nifty.columns:
+        nifty["datetime"] = pd.to_datetime(nifty["datetime"])
+        nifty = nifty.sort_values("datetime")
+    else:
+        nifty = nifty.reset_index().rename(columns={"index": "datetime"})
+        nifty["datetime"] = pd.to_datetime(nifty["datetime"])
+        nifty = nifty.sort_values("datetime")
+
+    nc = nifty["close"].astype(float)
+    nh = nifty["high"].astype(float)
+    nl = nifty["low"].astype(float)
+
+    nifty_feat = pd.DataFrame({"datetime": nifty["datetime"]})
+    nifty_feat["nifty_roc5"] = nc.pct_change(5)
+    nifty_feat["nifty_trend"] = _ema(nc, 9) - _ema(nc, 21)
+    nifty_feat["nifty_ret_1"] = nc.pct_change(1)
+    nifty_feat["nifty_ret_5"] = nc.pct_change(5)
+    nifty_feat["nifty_above_ema20"] = (nc > _ema(nc, 20)).astype(int)
+    nifty_feat["nifty_rsi"] = _rsi(nc, 14)
+    nifty_feat["nifty_atr_pct"] = _atr(nh, nl, nc, 14) / (nc + 1e-9)
+
+    merged = pd.merge_asof(
+        feat[["datetime", "roc_5"]].sort_values("datetime"),
+        nifty_feat.sort_values("datetime"),
+        on="datetime",
+        direction="backward",
     )
+    merged.index = feat.sort_values("datetime").index
+    merged = merged.sort_index()
 
-    g["is_first_30min"] = (
-        g["mins_since_open"] <= 30
-    ).astype(int)
-
-    g["is_last_30min"] = (
-        g["mins_since_open"] >= 330
-    ).astype(int)
-
-    g["session_frac"] = (
-        g["mins_since_open"] / 375.0
-    ).clip(0, 1)
-
-    # ── Institutional trend structure ────────────────────────
-    g["trend_strength"] = (
-        (g["ema_20"] > g["ema_50"])
-        & (c > g["vwap"])
-    ).astype(int)
-
-    trend_score = (
-        (g["ema_20"] - g["ema_50"]).abs()
-        / (c + 1e-9)
-    )
-
-    trend_mean = (
-        trend_score
-        .rolling(20)
-        .mean()
-        .shift(1)
-    )
-
-    g["is_trending"] = (
-        trend_score > trend_mean
-    ).astype(int)
-
-    # ── Day-of-week ──────────────────────────────────────────
-    g["day_of_week"] = (
-        g["datetime"].dt.dayofweek
-    )
-
-    g["is_monday"] = (
-        g["day_of_week"] == 0
-    ).astype(int)
-
-    g["is_friday"] = (
-        g["day_of_week"] == 4
-    ).astype(int)
-
-    # ── VWAP alignment ───────────────────────────────────────
-    g["above_vwap"] = (
-        c > g["vwap"]
-    ).astype(int)
-
-    return g.drop(
-        columns=["trade_date"],
-        errors="ignore"
-    )
+    out = pd.DataFrame(index=feat.index)
+    out["nifty_roc5"] = merged["nifty_roc5"].values
+    out["rs_vs_nifty"] = feat["roc_5"].values - out["nifty_roc5"].values
+    out["rs_acceleration"] = pd.Series(out["rs_vs_nifty"], index=feat.index).diff(3).values
+    out["nifty_trend"] = merged["nifty_trend"].values
+    out["nifty_ret_1"] = merged["nifty_ret_1"].values
+    out["nifty_ret_5"] = merged["nifty_ret_5"].values
+    out["nifty_above_ema20"] = merged["nifty_above_ema20"].fillna(0).values
+    out["nifty_rsi"] = merged["nifty_rsi"].values
+    out["nifty_atr_pct"] = merged["nifty_atr_pct"].values
+    return out
 
 
-def build_features(
-    df: pd.DataFrame,
-    nifty_df: pd.DataFrame = None,
-    symbol: str = None,
-) -> pd.DataFrame:
-    """
-    Build all features for a DataFrame.
-
-    Accepts EITHER:
-      (a) Multi-stock DataFrame with a 'symbol' column
-      (b) Single-stock DataFrame without 'symbol'
-          -> pass symbol='AXISBANK' or it defaults to 'STOCK'
-
-    In both cases the output always has a 'symbol' column.
-    """
+def build_features(df: pd.DataFrame, nifty_df: pd.DataFrame = None, symbol: str = None) -> pd.DataFrame:
     df = df.copy()
 
-    # ── Normalise datetime column ─────────────────────────────
     if "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"])
     else:
         df = df.reset_index().rename(columns={"index": "datetime"})
         df["datetime"] = pd.to_datetime(df["datetime"])
 
-    # ── Ensure symbol column exists ───────────────────────────
     if "symbol" not in df.columns:
         df["symbol"] = symbol if symbol else "STOCK"
 
@@ -468,89 +282,20 @@ def build_features(
 
     feat = (
         df.groupby("symbol", group_keys=False)
-          .apply(_build_symbol_features)
-          .reset_index(drop=True)
+        .apply(_build_symbol_features)
+        .reset_index(drop=True)
     )
 
-    if "symbol" not in feat.columns:
-        base_cols = [c for c in ["datetime", "symbol"] if c in df.columns]
-        feat = feat.merge(df[base_cols], on="datetime", how="left")
-        if "symbol" not in feat.columns:
-            feat["symbol"] = symbol if symbol else "STOCK"
-
-    # ── Nifty relative-strength features (batch add) ─────────
-    nifty_block = pd.DataFrame(index=feat.index)
-
-    if nifty_df is not None and not nifty_df.empty:
-        try:
-            nifty = nifty_df.copy()
-
-            if "datetime" in nifty.columns:
-                nifty["datetime"] = pd.to_datetime(nifty["datetime"])
-                nifty = nifty.sort_values("datetime").set_index("datetime")
-            else:
-                nifty.index = pd.to_datetime(nifty.index)
-                nifty = nifty.sort_index()
-
-            nc = nifty["close"].reindex(feat["datetime"], method="ffill")
-            nh = nifty["high"].reindex(feat["datetime"], method="ffill")
-            nl = nifty["low"].reindex(feat["datetime"], method="ffill")
-
-            nifty_block["nifty_roc5"] = nc.pct_change(5).values
-            nifty_block["rs_vs_nifty"] = feat["roc_5"].values - nifty_block["nifty_roc5"].values
-            nifty_block["rs_acceleration"] = pd.Series(
-                nifty_block["rs_vs_nifty"], index=feat.index
-            ).diff(3).values
-            nifty_block["nifty_trend"] = (_ema(nc, 9) - _ema(nc, 21)).values
-            nifty_block["nifty_ret_1"] = nc.pct_change(1).values
-            nifty_block["nifty_ret_5"] = nc.pct_change(5).values
-            nifty_block["nifty_above_ema20"] = (
-                nc > nc.ewm(span=20).mean().shift(1)
-            ).astype(int).values
-            nifty_block["nifty_rsi"] = _rsi(nc, 14).values
-            nifty_block["nifty_atr_pct"] = (
-                _atr(nh, nl, nc, 14) / (nc + 1e-9)
-            ).values
-
-        except Exception:
-            for col in _NIFTY_COLS:
-                nifty_block[col] = 0.0
-            nifty_block["rs_acceleration"] = 0.0
-    else:
-        for col in _NIFTY_COLS:
-            nifty_block[col] = 0.0
-        nifty_block["rs_acceleration"] = 0.0
-
+    nifty_block = _build_nifty_block(feat, nifty_df)
     feat = pd.concat([feat, nifty_block], axis=1)
 
-    # ── Forward-return label (batch add) ─────────────────────
-    if "target" not in feat.columns:
-        future_ret = feat.groupby("symbol")["close"].shift(-1) / feat["close"] - 1
-        target_block = pd.DataFrame(
-            {"target": (future_ret > 0.003).astype(int)},
-            index=feat.index
-        )
-        feat = pd.concat([feat, target_block], axis=1)
-
-    # Optional de-fragment after wide concat
     feat = feat.copy()
+    feat[FEATURE_COLS] = feat.groupby("symbol")[FEATURE_COLS].shift(1)
 
-    # ── Force all features to use ONLY past candles ──────────
-    feat[FEATURE_COLS] = (
-        feat.groupby("symbol")[FEATURE_COLS]
-            .shift(1)
-    )
-
-    # ── Drop rows with NaN in any feature or target ──────────
-    drop_cols = [c for c in FEATURE_COLS + ["target"] if c in feat.columns]
-
-    feat = (
-        feat.dropna(subset=drop_cols)
-            .reset_index(drop=True)
-    )
-
+    feat = feat.dropna(subset=FEATURE_COLS).reset_index(drop=True)
     return feat
-# ── Nifty column list (used in two places above) ─────────────
+
+
 _NIFTY_COLS = [
     "nifty_roc5",
     "rs_vs_nifty",
@@ -563,172 +308,22 @@ _NIFTY_COLS = [
     "nifty_atr_pct",
 ]
 
+
 FEATURE_COLS = [
-
-    # =========================================================
-    # TREND STRUCTURE
-    # Institutional trend alignment & directional bias
-    # =========================================================
-    "ema_cross",
-    "ema_cross_50",
-    "ema_spread_velocity",
-
-    "price_vs_ema9",
-    "price_vs_ema21",
-    "price_vs_ema50",
-    #"ema_50",
-
-    "trend_strength",
-    "is_trending",
-
-    "dist_from_ema20",
-    "dist_from_vwap",
-
-    "above_vwap",
-
-    # =========================================================
-    # MOMENTUM
-    # Short-term impulse + continuation strength
-    # =========================================================
-    "rsi_14",
-    "rsi_7",
-    "rsi_21",
-    "rsi_slope",
-
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "macd_hist_slope",
-
-    "stoch_k",
-    "stoch_d",
-    "stoch_cross",
-
-    "roc_3",
-    "roc_5",
-    "roc_10",
-    "roc_20",
-
-    "cci_20",
-    "willr_14",
-
-    # =========================================================
-    # VOLATILITY REGIME
-    # Detect expansion / contraction phases
-    # =========================================================
-    "atr_pct",
-    "atr_ratio",
-
-    "bb_width",
-    "bb_position",
-    "bb_squeeze",
-
-    "kc_position",
-
-    "hvol_20",
-    
-    "range_expansion",
-
-    # =========================================================
-    # VOLUME + VWAP FLOW
-    # Smart-money participation detection
-    # =========================================================
-    "vol_ratio",
-    "vol_spike",
-    "vol_acceleration",
-
-    "price_vs_vwap",
-    "vwap_slope",
-
-    "vwm_5",
-    "vwm_10",
-
-    # =========================================================
-    # CANDLE STRUCTURE
-    # Order-flow footprint inside candle anatomy
-    # =========================================================
-    "hl_range",
-    
-    "close_position_in_range",
-
-    "body",
-    "upper_wick",
-    "lower_wick",
-
-    "gap",
-
-    "doji",
-    "hammer",
-    "shooting_star",
-
-    "candle_body_pct",
-    "strong_bull_candle",
-
-    # =========================================================
-    # RETURN MEMORY
-    # Multi-horizon momentum persistence
-    # =========================================================
-    "ret_lag1",
-    "ret_lag2",
-    "ret_lag3",
-    "ret_lag5",
-    "ret_lag8",
-    "ret_lag13",
-
-    "autocorr_5",
-
-    # =========================================================
-    # BREAKOUT + MARKET STRUCTURE
-    # Expansion from compression / resistance escape
-    # =========================================================
-    "near_high20",
-    "near_low20",
-    "near_high50",
-
-    "range_pct_20",
-    
-    "distance_from_day_high",
-
-    "breakout_confirm",
-
-    # =========================================================
-    # SESSION CONTEXT
-    # Intraday behavioural regime
-    # =========================================================
-    "hour",
-    "minute",
-
-    "mins_since_open",
-
-    "is_first_30min",
-    "is_last_30min",
-
-    "session_frac",
-
-    # =========================================================
-    # WEEKDAY EFFECTS
-    # Statistical behaviour by session type
-    # =========================================================
-    "day_of_week",
-    "is_monday",
-    "is_friday",
-
-    # =========================================================
-    # INDEX RELATIVE STRENGTH
-    # Stock performance vs market regime
-    # =========================================================
-    "nifty_roc5",
-    "rs_vs_nifty",
-    
-    "rs_acceleration",
-
-    "nifty_trend",
-
-    "nifty_ret_1",
-    "nifty_ret_5",
-
-    "nifty_above_ema20",
-
-    "nifty_rsi",
-    "nifty_atr_pct",
+    "ema_cross", "ema_cross_50", "ema_spread_velocity",
+    "price_vs_ema9", "price_vs_ema21", "price_vs_ema50",
+    "trend_strength", "is_trending", "dist_from_ema20", "dist_from_vwap", "above_vwap",
+    "rsi_14", "rsi_7", "rsi_21", "rsi_slope",
+    "macd", "macd_signal", "macd_hist", "macd_hist_slope",
+    "stoch_k", "stoch_d", "stoch_cross",
+    "roc_3", "roc_5", "roc_10", "roc_20",
+    "cci_20", "willr_14",
+    "atr_pct", "atr_ratio", "bb_width", "bb_position", "bb_squeeze", "kc_position", "hvol_20", "range_expansion",
+    "vol_ratio", "vol_spike", "vol_acceleration", "price_vs_vwap", "vwap_slope", "vwm_5", "vwm_10",
+    "hl_range", "close_position_in_range", "body", "upper_wick", "lower_wick", "gap", "doji", "hammer", "shooting_star", "candle_body_pct", "strong_bull_candle",
+    "ret_lag1", "ret_lag2", "ret_lag3", "ret_lag5", "ret_lag8", "ret_lag13", "autocorr_5",
+    "near_high20", "near_low20", "near_high50", "range_pct_20", "distance_from_day_high", "breakout_confirm",
+    "hour", "minute", "mins_since_open", "is_first_30min", "is_last_30min", "session_frac",
+    "day_of_week", "is_monday", "is_friday",
+    "nifty_roc5", "rs_vs_nifty", "rs_acceleration", "nifty_trend", "nifty_ret_1", "nifty_ret_5", "nifty_above_ema20", "nifty_rsi", "nifty_atr_pct",
 ]

@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from data.features import build_features, FEATURE_COLS
+from bot.trade_policy import HORIZON, ATR_SL_MULT, ATR_TP_MULT
 #from bot.trade_policy import HORIZON
 
 # ─────────────────────────────────────────────────────────────
@@ -81,11 +82,11 @@ PARAMS = dict(
 # Training Config
 # ─────────────────────────────────────────────────────────────
 N_SPLITS            = 5
-PREDICTION_THRESHOLD = 0.95
+PREDICTION_THRESHOLD = 0.60
 
 MIN_ACC    = 0.53
 MIN_AUC    = 0.55
-MIN_PREC   = 0.75
+MIN_PREC   = 0.62
 MIN_TRADES = 50
 
 # ─────────────────────────────────────────────────────────────
@@ -183,71 +184,64 @@ def load_all_stocks() -> tuple[pd.DataFrame, pd.DataFrame]:
 # Momentum continuation labels
 # Predict sustained expansion after entry
 # ─────────────────────────────────────────────────────────────
-def _make_continuation_labels(
-        feat: pd.DataFrame,
-        horizon: int = 12,
-        target_pct: float = 0.015,
-    ) -> pd.DataFrame:
+def _make_atr_labels(
+    feat: pd.DataFrame,
+    horizon: int = HORIZON,
+    atr_sl_mult: float = ATR_SL_MULT,
+    atr_tp_mult: float = ATR_TP_MULT,
+) -> pd.DataFrame:
+    feat = (
+        feat.copy()
+        .sort_values(["symbol", "datetime"])
+        .reset_index(drop=True)
+    )
 
-        feat = (
-            feat.copy()
-            .sort_values(["symbol", "datetime"])
-            .reset_index(drop=True)
-        )
+    all_frames = []
 
-        all_frames = []
+    for sym, g in feat.groupby("symbol", sort=False):
+        g = g.reset_index(drop=True).copy()
 
-        for sym, g in feat.groupby("symbol", sort=False):
+        atr = g["atr_14"].astype(float)
+        close = g["close"].astype(float)
 
-            g = g.reset_index(drop=True)
+        tp_barrier = close + (atr_tp_mult * atr)
+        sl_barrier = close - (atr_sl_mult * atr)
 
-            future_high = pd.concat(
-                [
-                    g["high"].shift(-i)
-                    for i in range(1, horizon + 1)
-                ],
-                axis=1,
-            ).max(axis=1)
+        labels = np.zeros(len(g), dtype=int)
+        weights = np.ones(len(g), dtype=float)
 
-            future_low = pd.concat(
-                [
-                    g["low"].shift(-i)
-                    for i in range(1, horizon + 1)
-                ],
-                axis=1,
-            ).min(axis=1)
+        for i in range(len(g)):
+            if i + 1 >= len(g):
+                continue
 
-            future_upside = (
-                (future_high - g["close"])
-                / (g["close"] + 1e-9)
-            )
+            end = min(i + horizon, len(g) - 1)
+            future = g.iloc[i + 1:end + 1]
 
-            future_drawdown = (
-                (future_low - g["close"])
-                / (g["close"] + 1e-9)
-            )
+            if future.empty:
+                continue
 
-            g["target"] = (
-                (future_upside > target_pct)
-                & (future_drawdown > -0.004)
-            ).astype(int)
+            future_high = future["high"].values
+            future_low = future["low"].values
 
-            g["sample_weight"] = np.where(
-                g["target"] == 1,
-                np.clip(
-                    future_upside / target_pct,
-                    1.0,
-                    3.0,
-                ),
-                1.0,
-            )
+            hit_tp_idx = np.where(future_high >= tp_barrier.iloc[i])[0]
+            hit_sl_idx = np.where(future_low <= sl_barrier.iloc[i])[0]
 
-            all_frames.append(g)
+            first_tp = hit_tp_idx[0] if len(hit_tp_idx) else None
+            first_sl = hit_sl_idx[0] if len(hit_sl_idx) else None
 
-        return pd.concat(
-            all_frames,
-            ignore_index=True,
-        )
+            if first_tp is not None and (first_sl is None or first_tp < first_sl):
+                labels[i] = 1
+                move = (future_high[first_tp] - close.iloc[i]) / max(close.iloc[i], 1e-9)
+                weights[i] = float(np.clip(1.0 + (move * 40.0), 1.0, 3.0))
+            else:
+                labels[i] = 0
+                weights[i] = 1.0
+
+        g["target"] = labels
+        g["sample_weight"] = weights
+        all_frames.append(g)
+
+    return pd.concat(all_frames, ignore_index=True)
 # ─────────────────────────────────────────────────────────────
 # Prepare Dataset
 # ─────────────────────────────────────────────────────────────
@@ -276,10 +270,11 @@ def prepare_dataset(
     # Replace temporary target
     feat = feat.drop(columns=["target"], errors="ignore")
 
-    feat = _make_continuation_labels(
+    feat = _make_atr_labels(
     feat,
-    horizon=6,
-    target_pct=0.012,
+    horizon=HORIZON,
+    atr_sl_mult=ATR_SL_MULT,
+    atr_tp_mult=ATR_TP_MULT,
 )
 
     # Remove infinities
@@ -515,21 +510,24 @@ def train_final(X, y,weights):
     model = calibrated_model
 
     # ── Feature importance ────────────────────────────────
-    base_model = model.estimator
-    
-    base_model = getattr(
-        model,
-        "estimator",
-        None
-    )
+    base_model = getattr(model, "estimator", None)
 
     if base_model is None:
         base_model = model
 
-    imp = pd.DataFrame({
-        "feature": FEATURE_COLS,
-        "importance": base_model.feature_importances_,
-    })
+    if hasattr(base_model, "feature_importances_"):
+        imp = pd.DataFrame({
+            "feature": FEATURE_COLS,
+            "importance": base_model.feature_importances_,
+        }).sort_values("importance", ascending=False)
+
+        imp.to_csv(FIMP_PATH, index=False)
+
+        top10 = imp.head(10)["feature"].tolist()
+        print("\nTop-10 features:")
+        print(top10)
+    else:
+        log.warning("feature_importances_ not available on calibrated model; skipping feature importance export.")
 
     imp = imp.sort_values(
         "importance",

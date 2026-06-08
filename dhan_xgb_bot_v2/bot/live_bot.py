@@ -324,7 +324,7 @@ class LiveBot:
         self._last_scan_ts    = 0.0
         self._entry_quotes:   dict[str, dict] = {}
         self._nifty_refreshed = False
-
+        self.cooldown_bars = {}   # symbol -> remaining bars
         # FIX-4: Circuit breaker alert sent only once per halt period.
         # Prevents Telegram spam when the bot is halted for the day.
         self._circuit_alert_sent = False
@@ -704,6 +704,289 @@ class LiveBot:
     # ──────────────────────────────────────────────────────────
     def _scan_and_enter(self):
         """
+        Full watchlist scan -> rank BUY signals by confidence ->
+        enter top candidates up to available slots.
+
+        Design principles:
+        - Skip opening 15 min (NO_NEW_TRADE_BEFORE=09:30)
+        - Respect sector concentration limits
+        - Spread, liquidity, drift gates before execution
+        - Confidence-ranked selection
+        - Rotation only when max slots are full and a new signal is clearly better
+        """
+
+        if _now_time() < _parse_time(NO_NEW_TRADE_BEFORE):
+            log.info("Pre-trade window: waiting until %s", NO_NEW_TRADE_BEFORE)
+            return
+        if _no_new_trades():
+            return
+
+        if self.risk.is_halted():
+            log.critical(
+                "RiskManager halted trading — scan aborted. "
+                "(daily loss / consecutive SL limit breached)"
+            )
+            return
+
+        daily_loss_pct = self.risk.daily_pnl / CAPITAL
+        if daily_loss_pct <= NEW_TRADE_LOSS_PAUSE:
+            log.warning(
+                "Daily loss %.2f%% ≤ pause threshold %.2f%% — no new entries.",
+                daily_loss_pct * 100, NEW_TRADE_LOSS_PAUSE * 100,
+            )
+            return
+
+        max_slots_full = len(self.trades) >= MAX_OPEN_TRADES
+
+        log.info("── Scan: ranking %d eligible stocks ──", len(WATCHLIST))
+
+        candidates: list[tuple[str, str, dict, dict]] = []
+
+        for symbol, sec_id in WATCHLIST.items():
+            if symbol.upper() in BLOCKED_SYMBOLS:
+                continue
+            if symbol in self.trades:
+                continue
+            if symbol in self.sl_blacklist:
+                log.debug("%s: SL-blacklisted today — skip.", symbol)
+                continue
+
+            cooldown = self.cooldown_bars.get(symbol, 0)
+            if cooldown > 0:
+                self.cooldown_bars[symbol] = cooldown - 1
+                log.debug("%s: cooldown active (%d bars left)", symbol, cooldown)
+                continue
+
+            sector = SECTOR_MAP.get(symbol, "unknown")
+            sector_count = sum(
+                1 for s in self.trades
+                if SECTOR_MAP.get(s, "unknown") == sector
+            )
+            if sector_count >= MAX_PER_SECTOR:
+                continue
+
+            df = self.broker.get_candles(sec_id, symbol, days_back=10)
+            if df.empty:
+                continue
+
+            result = self.engine.score(df, symbol=symbol)
+            if result["signal"] != "BUY":
+                reason_str = result.get("reason", "")
+                if reason_str and reason_str not in (
+                    "null", "blocked_symbol", "insufficient_data",
+                    "feature_error", "empty_features",
+                    "missing_features", "nan_in_features",
+                    "predict_error", "invalid_atr_or_price"
+                ):
+                    for r in reason_str.split(","):
+                        r = r.strip()
+                        if r:
+                            self.rejection_stats[r] += 1
+                            if symbol not in self.rejection_symbols[r]:
+                                self.rejection_symbols[r].append(symbol)
+                continue
+
+            entry = result["entry"]
+            sl = result["sl"]
+            target = result["target"]
+            rr = result["rr"]
+
+            if any(v <= 0 for v in [entry, sl, target, rr]):
+                log.warning(
+                    "%s: invalid engine output entry=%.2f sl=%.2f — skip",
+                    symbol, entry, sl,
+                )
+                continue
+
+            ok, quote = self._passes_entry_filters(
+                symbol, sec_id, entry, reason_prefix="[SCAN] "
+            )
+            if not ok:
+                continue
+
+            candidates.append((symbol, sec_id, result, quote))
+            log.info(
+                "  Candidate %-14s prob=%.3f entry=%.2f SL=%.2f TP=%.2f "
+                "R:R=%.2fx ev=%.3f spread=%.4f%% [%s]",
+                symbol, result["prob_up"], entry, sl, target, rr,
+                result["prob_up"] * rr,
+                (quote.get("spread_pct") or 0.0) * 100,
+                sector,
+            )
+
+        if not candidates:
+            log.info("No BUY signals this scan.")
+            if self.rejection_stats:
+                top = sorted(self.rejection_stats.items(), key=lambda x: -x[1])[:6]
+                summary = " | ".join(f"{k}={v}" for k, v in top)
+                log.info("  Rejection stats (today): %s", summary)
+            return
+
+        def calibrated_score(prob, rr):
+            calibrated = 0.50 + ((prob - 0.50) * 0.35)
+            return calibrated * rr
+
+        candidates.sort(
+            key=lambda x: calibrated_score(
+                x[2]["prob_up"],
+                x[2].get("rr", 1.0),
+            ),
+            reverse=True,
+        )
+
+        for rank, (sym, _, res, _) in enumerate(candidates, start=1):
+            log.info(
+                "  Rank #%d %-14s prob=%.3f rr=%.2fx ev=%.3f",
+                rank,
+                sym,
+                res["prob_up"],
+                res.get("rr", 0.0),
+                res["prob_up"] * res.get("rr", 1.0),
+            )
+
+        best_sym, best_sec_id, best_result, best_quote = candidates[0]
+        log.info(
+            "Best signal: %-14s prob=%.3f rr=%.2fx ev_score=%.3f scan_rank=1/%d",
+            best_sym,
+            best_result["prob_up"],
+            best_result.get("rr", 0.0),
+            best_result["prob_up"] * best_result.get("rr", 1.0),
+            len(candidates),
+        )
+
+        if max_slots_full:
+            should_rotate, exit_sym = self._should_rotate(best_result["prob_up"])
+
+            if should_rotate and exit_sym:
+                trade_to_exit = self.trades[exit_sym]
+
+                if trade_to_exit.candles_held < self._ROTATION_MIN_CANDLES:
+                    log.info(
+                        "ROTATION BLOCKED (time hysteresis): %s only %d candles old "
+                        "(min=%d). Position too young to rotate.",
+                        exit_sym,
+                        trade_to_exit.candles_held,
+                        self._ROTATION_MIN_CANDLES,
+                    )
+                    return
+
+                ev_new = _expected_pnl(
+                    prob_up=best_result["prob_up"],
+                    entry=best_result["entry"],
+                    sl=best_result["sl"],
+                    target=best_result["target"],
+                    qty=self.risk.position_size(
+                        best_result["entry"], best_result["sl"]
+                    ),
+                )
+
+                ev_old = _expected_pnl(
+                    prob_up=trade_to_exit.last_prob,
+                    entry=trade_to_exit.entry,
+                    sl=trade_to_exit.stop_loss,
+                    target=trade_to_exit.target,
+                    qty=trade_to_exit.qty,
+                )
+
+                roundtrip_cost = (
+                    trade_to_exit.entry
+                    * trade_to_exit.qty
+                    * self._ROTATION_ROUNDTRIP_COST_PCT
+                )
+
+                ev_gain = ev_new - ev_old
+
+                if ev_gain <= roundtrip_cost:
+                    log.info(
+                        "ROTATION BLOCKED (ev gate): %s -> %s "
+                        "ev_new=₹%.2f ev_old=₹%.2f ev_gain=₹%.2f <= cost=₹%.2f",
+                        exit_sym, best_sym, ev_new, ev_old, ev_gain, roundtrip_cost,
+                    )
+                    return
+
+                id_map = {str(trade_to_exit.security_id): exit_sym}
+                prices = self.broker.get_ltp_batch(id_map)
+                ltp = prices.get(str(trade_to_exit.security_id), trade_to_exit.entry)
+
+                log.info(
+                    "ROTATION APPROVED: exiting %s (held=%d candles, ev_gain=₹%.2f > cost=₹%.2f) -> entering %s",
+                    exit_sym,
+                    trade_to_exit.candles_held,
+                    ev_gain,
+                    roundtrip_cost,
+                    best_sym,
+                )
+                self._exit_trade(trade_to_exit, ltp, "ROTATION_BETTER_SIGNAL")
+            else:
+                log.info("Max open trades (%d). No rotation opportunity.", MAX_OPEN_TRADES)
+                return
+
+        available_slots = max(0, MAX_OPEN_TRADES - len(self.trades))
+        if available_slots <= 0:
+            return
+
+        selected_candidates = candidates[:available_slots]
+
+        for scan_rank, (sym, sec_id, result, quote) in enumerate(selected_candidates, start=1):
+            entry = result["entry"]
+            sl = result["sl"]
+            target = result["target"]
+            rr = result["rr"]
+
+            if any(v <= 0 for v in [entry, sl, target, rr]):
+                log.warning("%s: final proposal invalid — skip.", sym)
+                continue
+
+            sector = SECTOR_MAP.get(sym, "unknown")
+            sector_count = sum(
+                1 for s in self.trades
+                if SECTOR_MAP.get(s, "unknown") == sector
+            )
+            if sector_count >= MAX_PER_SECTOR:
+                log.info("%s: skipped at entry stage due to sector cap.", sym)
+                continue
+
+            qty = self.risk.position_size(entry, sl)
+            if qty <= 0:
+                log.warning("%s: position size = 0 — skip.", sym)
+                continue
+
+            log.info(
+                "SIGNAL BUY %-14s entry=%.2f SL=%.2f TP=%.2f qty=%d prob=%.3f R:R=%.2fx ev=%.3f scan_rank=%d/%d sector=%s spread=%.4f%%",
+                sym,
+                entry, sl, target, qty,
+                result["prob_up"],
+                rr,
+                result["prob_up"] * rr,
+                scan_rank,
+                len(candidates),
+                sector,
+                (quote.get("spread_pct") or 0.0) * 100,
+            )
+
+            if BOT_MODE == "live":
+                ok, entry_quote = self._passes_entry_filters(
+                    sym,
+                    sec_id,
+                    entry,
+                    reason_prefix="[ENTRY] ",
+                )
+                if not ok:
+                    log.warning("%s: entry execution filters failed.", sym)
+                    continue
+
+                self._entry_quotes[sym] = {
+                    "entry": entry,
+                    "ts": time.time(),
+                }
+                self._enter_live(
+                    sym, sec_id, qty, entry, sl, target, result,
+                )
+            else:
+                self._enter_paper(
+                    sym, sec_id, qty, entry, sl, target, result,
+                )
+        """
         Full watchlist scan → rank BUY signals by confidence →
         pick highest-quality setup → execute.
 
@@ -776,6 +1059,18 @@ class LiveBot:
             if symbol in self.sl_blacklist:
                 log.debug("%s: SL-blacklisted today — skip.", symbol)
                 continue
+             # NEW: cooldown after exit
+            cooldown = self.cooldown_bars.get(symbol, 0)
+
+            if cooldown > 0:
+                self.cooldown_bars[symbol] = cooldown - 1
+
+                log.debug(
+                    "%s: cooldown active (%d bars left)",
+                    symbol,
+                    cooldown
+                )
+                continue
 
             sector = SECTOR_MAP.get(symbol, "unknown")
             sector_count = sum(
@@ -791,13 +1086,6 @@ class LiveBot:
             df = self.broker.get_candles(sec_id, symbol, days_back=10)
             if df.empty:
                 continue
-
-            ema20 = df["close"].ewm(span=20).mean().iloc[-1]
-            ema50 = df["close"].ewm(span=50).mean().iloc[-1]
-
-            # Only trade aligned trends
-            #if ema20 <= ema50:
-            #    continue
 
             result = self.engine.score(df, symbol=symbol)
             if result["signal"] != "BUY":
@@ -865,29 +1153,20 @@ class LiveBot:
             reverse=True,
         )
 
-        best_sym, best_sec_id, best_result, best_quote = candidates[0]
-
-        for rank, (sym, _, res, _) in enumerate(candidates, start=1):
-            log.info(
-                "  Rank #%d  %-14s  prob=%.3f  rr=%.2fx  ev=%.3f",
-                rank, sym,
-                res["prob_up"],
-                res.get("rr", 0.0),
-                res["prob_up"] * res.get("rr", 1.0),
-            )
+        max_slots_full = len(self.trades) >= MAX_OPEN_TRADES
+        available_slots = max(0, MAX_OPEN_TRADES - len(self.trades))
 
         log.info(
             "Best signal: %-14s prob=%.3f  rr=%.2fx  ev_score=%.3f  scan_rank=1/%d",
-            best_sym,
-            best_result["prob_up"],
-            best_result.get("rr", 0.0),
-            best_result["prob_up"] * best_result.get("rr", 1.0),
+            result["prob_up"],
+            result.get("rr", 0.0),
+            result["prob_up"] * result.get("rr", 1.0),
             len(candidates),
         )
 
         # ── Portfolio rotation check ──────────────────────────
         if max_slots_full:
-            should_rotate, exit_sym = self._should_rotate(best_result["prob_up"])
+            should_rotate, exit_sym = self._should_rotate(result["prob_up"])
 
             if should_rotate and exit_sym:
                 trade_to_exit = self.trades[exit_sym]
@@ -903,12 +1182,12 @@ class LiveBot:
                     return
 
                 ev_new = _expected_pnl(
-                    prob_up = best_result["prob_up"],
-                    entry   = best_result["entry"],
-                    sl      = best_result["sl"],
-                    target  = best_result["target"],
+                    prob_up = result["prob_up"],
+                    entry   = result["entry"],
+                    sl      = result["sl"],
+                    target  = result["target"],
                     qty     = self.risk.position_size(
-                                best_result["entry"], best_result["sl"]
+                                result["entry"], result["sl"]
                             ),
                 )
 
@@ -934,12 +1213,12 @@ class LiveBot:
                         "ev_new=₹%.2f  ev_old=₹%.2f  "
                         "ev_gain=₹%.2f ≤ cost=₹%.2f. "
                         "Rotation does not justify transaction friction.",
-                        exit_sym, best_sym,
+                        exit_sym, sym,
                         ev_new, ev_old,
                         ev_gain, roundtrip_cost,
                     )
                     return
-
+                
                 id_map = {str(trade_to_exit.security_id): exit_sym}
                 prices = self.broker.get_ltp_batch(id_map)
                 ltp    = prices.get(
@@ -952,7 +1231,7 @@ class LiveBot:
                     trade_to_exit.candles_held,
                     ev_gain,
                     roundtrip_cost,
-                    best_sym,
+                    sym,
                 )
                 self._exit_trade(trade_to_exit, ltp, "ROTATION_BETTER_SIGNAL")
 
@@ -964,57 +1243,57 @@ class LiveBot:
                 return
 
         # ── Final signal validation ───────────────────────────
-        entry  = best_result["entry"]
-        sl     = best_result["sl"]
-        target = best_result["target"]
-        rr     = best_result["rr"]
+        entry  = result["entry"]
+        sl     = result["sl"]
+        target = result["target"]
+        rr     = result["rr"]
 
         if any(v <= 0 for v in [entry, sl, target, rr]):
-            log.warning("%s: final proposal invalid — skip.", best_sym)
+            log.warning("%s: final proposal invalid — skip.", sym)
             return
 
         qty = self.risk.position_size(entry, sl)
 
         if qty <= 0:
-            log.warning("%s: position size = 0 — skip.", best_sym)
+            log.warning("%s: position size = 0 — skip.", sym)
             return
 
         log.info(
             "SIGNAL BUY %-14s  entry=%.2f  SL=%.2f  TP=%.2f"
             "  qty=%d  prob=%.3f  R:R=%.2fx  ev=%.3f"
             "  scan_rank=1/%d  sector=%s  spread=%.4f%%",
-            best_sym,
+            sym,
             entry, sl, target, qty,
-            best_result["prob_up"],
+            result["prob_up"],
             rr,
-            best_result["prob_up"] * rr,
+            result["prob_up"] * rr,
             len(candidates),
-            SECTOR_MAP.get(best_sym, "?"),
-            (best_quote.get("spread_pct") or 0.0) * 100,
+            SECTOR_MAP.get(sym, "?"),
+            (quote.get("spread_pct") or 0.0) * 100,
         )
 
         if BOT_MODE == "live":
             ok, quote = self._passes_entry_filters(
-                best_sym,
-                best_sec_id,
+                sym,
+                sec_id,
                 entry,
                 reason_prefix="[ENTRY] ",
             )
             if not ok:
-                log.warning("%s: entry execution filters failed.", best_sym)
+                log.warning("%s: entry execution filters failed.", sym)
                 return
 
-            self._entry_quotes[best_sym] = {
+            self._entry_quotes[sym] = {
                 "entry": entry,
                 "ts": time.time(),
             }
             self._enter_live(
-                best_sym, best_sec_id, qty, entry, sl, target, best_result,
+                sym, sec_id, qty, entry, sl, target, result,
             )
 
         else:
             self._enter_paper(
-                best_sym, best_sec_id, qty, entry, sl, target, best_result,
+                sym, sec_id, qty, entry, sl, target, result,
             )
 
     # ──────────────────────────────────────────────────────────
@@ -1406,6 +1685,7 @@ class LiveBot:
             reason=reason,
         )
         del self.trades[trade.symbol]
+        self.cooldown_bars[trade.symbol] = 2
 
     # ──────────────────────────────────────────────────────────
     #  Trade analysis log
@@ -1484,6 +1764,7 @@ class LiveBot:
         self._circuit_alert_sent = False          # BUG-B FIX: was self.circuitalertsent
         self.risk.reset_daily()
         self.closed_trades.clear()
+        self.cooldown_bars.clear()
         self._last_boundary_key = None            # BUG-C FIX: was self.last_boundary_key
         log.info("EOD reset complete.")
 

@@ -38,9 +38,9 @@ from config.config import (
 )
 
 # ── Must match signal_engine.py exactly ──────────────────────
-EXIT_LONG_THRESHOLD = 0.50
-WEAK_THRESHOLD      = 0.55
-WEAK_CANDLES_MAX    = 2
+EXIT_LONG_THRESHOLD = 0.56
+WEAK_THRESHOLD      = 0.60
+WEAK_CANDLES_MAX    = 5
 
 # ── FIX 2: Blocked symbols — must match signal_engine.py ─────
 # These are skipped in simulation just as they are in live trading

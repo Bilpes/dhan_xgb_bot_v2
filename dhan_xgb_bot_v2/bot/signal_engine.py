@@ -61,14 +61,8 @@ from config.config import (
 log = logging.getLogger("signal_engine")
 
 
-MIN_RANGE_EXPANSION = 0.5
-MIN_EMA_SPREAD_VELOCITY = -0.001
-MAX_DIST_DAY_HIGH_ATR = 8
-MIN_RS_ACCELERATION = -0.005
-MIN_CLOSE_RANGE_POS = 0.25
-PROBABILITY_FLOOR = 0.40
-PROBABILITY_CAP = 0.90
-PROBABILITY_COMPRESSION = 0.85
+PROBABILITY_FLOOR = 0.0
+PROBABILITY_CAP = 0.95
 ATR_FLOOR_PCT = 0.003
 
 
@@ -144,7 +138,12 @@ class SignalEngine:
     def reset_symbol(self, symbol: str):
         self._weak_counts.pop(symbol, None)
 
-    def score(self, df: pd.DataFrame, symbol: str = "STOCK") -> dict:
+    def score(
+        self,
+        df: pd.DataFrame,
+        symbol: str = "STOCK",
+        for_exit: bool = False,
+    ) -> dict:
         if symbol.upper() in BLOCKED_SYMBOLS:
             return {**_NULL_RESULT, "reason": "blocked_symbol"}
 
@@ -174,7 +173,7 @@ class SignalEngine:
         try:
             x_scaled = self.scaler.transform(x_raw)
             raw_prob = float(self.model.predict_proba(x_scaled)[0, 1])
-            prob_up = 0.50 + ((raw_prob - 0.50) * PROBABILITY_COMPRESSION)
+            prob_up = raw_prob
             prob_up = max(PROBABILITY_FLOOR, min(prob_up, PROBABILITY_CAP))
         except Exception as e:
             log.warning("%s: model predict failed: %s", symbol, e)
@@ -183,19 +182,22 @@ class SignalEngine:
         vol_ratio = float(row.get("vol_ratio", 0.0))
         atr_pct = float(row.get("atr_pct", 0.0))
 
-        if vol_ratio < MIN_VOLUME_RATIO:
-            return {
-                **_NULL_RESULT,
-                "prob_up": round(prob_up, 4),
-                "reason": f"low_volume:{vol_ratio:.2f}",
-            }
+        if not for_exit:
+            if vol_ratio < MIN_VOLUME_RATIO:
+                return {
+                    **_NULL_RESULT,
+                    "prob_up": round(prob_up, 4),
+                    "raw_prob_up": round(raw_prob, 4),
+                    "reason": f"low_volume:{vol_ratio:.2f}",
+                }
 
-        if atr_pct < MIN_ATR_PCT:
-            return {
-                **_NULL_RESULT,
-                "prob_up": round(prob_up, 4),
-                "reason": f"low_atr:{atr_pct:.4f}",
-            }
+            if atr_pct < MIN_ATR_PCT:
+                return {
+                    **_NULL_RESULT,
+                    "prob_up": round(prob_up, 4),
+                    "raw_prob_up": round(raw_prob, 4),
+                    "reason": f"low_atr:{atr_pct:.4f}",
+                }
 
         entry = float(row.get("close", 0.0))
         atr = float(row.get("atr_14", 0.0))
@@ -204,6 +206,7 @@ class SignalEngine:
             return {
                 **_NULL_RESULT,
                 "prob_up": round(prob_up, 4),
+                "raw_prob_up": round(raw_prob, 4),
                 "reason": "invalid_atr_or_price",
             }
 
@@ -225,88 +228,56 @@ class SignalEngine:
 
         body_pct = abs(current_close - current_open) / current_open if current_open > 0 else 0.0
         breakout_ok = current_close > prev_high and vol_ratio >= MIN_VOLUME_RATIO_CONFIRM
-        body_ok = body_pct >= MIN_CANDLE_BODY_PCT
 
-        ema20 = float(row.get("ema_20", 0.0))
-        ema50 = float(row.get("ema_50", 0.0))
         vwap = float(row.get("vwap", 0.0))
-        trend_ok = ema20 > ema50 # and current_close > vwap
-
-        market_ok = (
-            row.get("nifty_above_ema20", 0) == 1
-            and float(row.get("nifty_trend", 0.0)) > 0
-            and float(row.get("nifty_rsi", 0.0)) > 55
-        )
-
-        atr_ratio = float(row.get("atr_ratio", 0.0))
-        volatility_expansion = atr_ratio > 0.85
-
-        range_expansion = float(row.get("range_expansion", 0.0))
-        ema_spread_velocity = float(row.get("ema_spread_velocity", 0.0))
-        distance_from_day_high = float(row.get("distance_from_day_high", 999.0))
-        rs_acceleration = float(row.get("rs_acceleration", 0.0))
-        close_position_in_range = float(row.get("close_position_in_range", 0.0))
-
-        distance_from_ema20 = float(row.get("dist_from_ema20", 999.0))
         dist_from_vwap = float(row.get("dist_from_vwap", 999.0))
-        not_extended = distance_from_ema20 <= MAX_DISTANCE_FROM_EMA20
-
         avoid_lunch = AVOID_LUNCH_HOURS and 12 <= int(row.get("hour", 0)) <= 13
 
+        atr_ratio = float(row.get("atr_ratio", 0.0))
+        range_expansion = float(row.get("range_expansion", 0.0))
+
         dynamic_threshold = self.buy_threshold
+
         market_strong = (
             row.get("nifty_above_ema20", 0) == 1
             and float(row.get("nifty_trend", 0.0)) > 0
             and atr_ratio > 1.1
         )
+
         market_weak = (
             row.get("nifty_above_ema20", 0) == 0
             or float(row.get("nifty_trend", 0.0)) <= 0
             or atr_ratio < 1.0
         )
 
-        if (
-            market_strong
-            and range_expansion > 1.3
-            and ema_spread_velocity > 0
-            and rs_acceleration > 0
-        ):
-            dynamic_threshold = min(dynamic_threshold, 0.61)
+        if market_strong and range_expansion >= 1.1:
+            dynamic_threshold = max(0.56, self.buy_threshold - 0.03)
         elif market_weak:
-            dynamic_threshold = max(dynamic_threshold, 0.60)
+            dynamic_threshold = min(0.64, self.buy_threshold + 0.02)
 
         reject_reason: list[str] = []
 
-        if prob_up < dynamic_threshold:
-            reject_reason.append("low_prob")
-        if rr < MIN_RR_RATIO:
-            reject_reason.append("low_rr")
-        if vol_ratio < MIN_VOLUME_RATIO_CONFIRM:
-            reject_reason.append("low_volume")
-        if REQUIRE_BREAKOUT_CONFIRMATION and not breakout_ok:
-            reject_reason.append("no_breakout")
-        if not body_ok:
-            reject_reason.append("weak_candle_body")
-        if REQUIRE_VWAP_CONFIRM and current_close < vwap:
-            reject_reason.append("below_vwap")
-        if TREND_STRENGTH_ENABLED and not trend_ok:
-            reject_reason.append("weak_trend")
-        if dist_from_vwap > MAX_DISTANCE_FROM_VWAP or not not_extended:
-            reject_reason.append("overextended")
-        if not volatility_expansion:
-            reject_reason.append("low_volatility")
-        if range_expansion < MIN_RANGE_EXPANSION:
-            reject_reason.append("weak_range_expansion")
-        if ema_spread_velocity <= MIN_EMA_SPREAD_VELOCITY:
-            reject_reason.append("slowing_trend")
-        if distance_from_day_high > MAX_DIST_DAY_HIGH_ATR:
-            reject_reason.append("far_from_day_high")
-        if rs_acceleration < MIN_RS_ACCELERATION:
-            reject_reason.append("weak_relative_strength")
-        if close_position_in_range < MIN_CLOSE_RANGE_POS:
-            reject_reason.append("weak_candle_close")
-        if avoid_lunch:
-            reject_reason.append("lunch_chop")
+        if not for_exit:
+            if prob_up < dynamic_threshold:
+                reject_reason.append("low_prob")
+
+            if rr < MIN_RR_RATIO:
+                reject_reason.append("low_rr")
+
+            if vol_ratio < MIN_VOLUME_RATIO_CONFIRM:
+                reject_reason.append("low_volume")
+
+            if REQUIRE_BREAKOUT_CONFIRMATION and not breakout_ok:
+                reject_reason.append("no_breakout")
+
+            if REQUIRE_VWAP_CONFIRM and current_close < vwap:
+                reject_reason.append("below_vwap")
+
+            if dist_from_vwap > MAX_DISTANCE_FROM_VWAP * 1.35:
+                reject_reason.append("too_far_from_vwap")
+
+            if avoid_lunch:
+                reject_reason.append("lunch_chop")
 
         signal = "HOLD"
         reason = "passed"
@@ -321,37 +292,22 @@ class SignalEngine:
                 rr,
             )
         else:
-            strong_continuation = (
-                range_expansion > 1.5
-                and ema_spread_velocity > 0
-                and rs_acceleration > 0
-                and close_position_in_range > 0.50
-            )
-
-            if not reject_reason:
-                signal = "BUY"
-                self._weak_counts.pop(symbol, None)
-            else:
-                reason = "weak_continuation"
+            signal = "BUY"
+            self._weak_counts.pop(symbol, None)
 
         log.debug(
-            "%s prob=%.3f signal=%s reason=%s body=%.4f vol=%.2f trend=%s "
-            "market=%s vol_exp=%s range_exp=%.2f ema_vel=%.4f rs_acc=%.4f "
-            "day_high_dist=%.2f close_pos=%.2f entry=%.2f SL=%.2f TP=%.2f R:R=%.2f ATR=%.4f",
+            "%s prob=%.3f raw=%.3f signal=%s reason=%s body=%.4f vol=%.2f "
+            "range_exp=%.2f atr_ratio=%.2f dist_vwap=%.4f entry=%.2f SL=%.2f TP=%.2f R:R=%.2f ATR=%.4f",
             symbol,
             prob_up,
+            raw_prob,
             signal,
             reason,
             body_pct,
             vol_ratio,
-            trend_ok,
-            market_ok,
-            volatility_expansion,
             range_expansion,
-            ema_spread_velocity,
-            rs_acceleration,
-            distance_from_day_high,
-            close_position_in_range,
+            atr_ratio,
+            dist_from_vwap,
             entry,
             sl,
             target,
@@ -362,6 +318,7 @@ class SignalEngine:
         return {
             "signal": signal,
             "prob_up": round(prob_up, 4),
+            "raw_prob_up": round(raw_prob, 4),
             "entry": round(entry, 2),
             "sl": sl,
             "target": target,
@@ -370,22 +327,32 @@ class SignalEngine:
             "atr_ratio": round(atr_ratio, 3),
             "reason": reason,
         }
-
-    def should_exit(self, df: pd.DataFrame, side: str, symbol: str = "STOCK") -> bool:
+    def should_exit(
+        self,
+        df: pd.DataFrame,
+        side: str,
+        symbol: str = "STOCK"
+    ) -> bool:
         """
-        True if the model recommends closing the open position.
-
-        LONG exit triggers:
-          1. Hard: prob_up < EXIT_LONG_THRESHOLD
-          2. Soft: N consecutive candles where prob_up < WEAK_THRESHOLD
-
-        Weak candle counter resets to 0 whenever prob_up >= WEAK_THRESHOLD.
-        Counter is cleared entirely on trade exit via reset_symbol().
+        Exit logic should depend only on model probability,
+        not on entry filters such as volume, VWAP, breakout,
+        lunch-hour rejection, overextension, etc.
         """
-        result = self.score(df, symbol=symbol)
-        prob = result["prob_up"]
+
+        result = self.score(
+            df,
+            symbol=symbol,
+            for_exit=True,
+        )
+
+        prob = result.get(
+            "raw_prob_up",
+            result["prob_up"]
+        )
 
         if side == "LONG":
+
+            # Hard exit
             if prob < EXIT_LONG_THRESHOLD:
                 log.info(
                     "%s: hard exit — prob_up=%.3f < EXIT_LONG=%.3f",
@@ -393,11 +360,15 @@ class SignalEngine:
                     prob,
                     EXIT_LONG_THRESHOLD,
                 )
+                self._weak_counts[symbol] = 0
                 return True
 
+            # Soft exit
             if prob < WEAK_THRESHOLD:
+
                 count = self._weak_counts.get(symbol, 0) + 1
                 self._weak_counts[symbol] = count
+
                 log.info(
                     "%s: weak candle %d/%d prob=%.3f",
                     symbol,
@@ -405,17 +376,21 @@ class SignalEngine:
                     WEAK_CANDLES_MAX,
                     prob,
                 )
+
                 if count >= WEAK_CANDLES_MAX:
                     log.info(
                         "%s: soft exit — %d consecutive weak candles",
                         symbol,
                         count,
                     )
+                    self._weak_counts[symbol] = 0
                     return True
+
             else:
                 self._weak_counts[symbol] = 0
 
         elif side == "SHORT":
+
             if prob > EXIT_SHORT_THRESHOLD:
                 log.info(
                     "%s: short exit — prob_up=%.3f > EXIT_SHORT=%.3f",

@@ -47,14 +47,14 @@ TRADE_MODE           = "cnc"       # CNC delivery (shares go to demat)
 AUTO_EXIT_IF_DOWN    = True        # sell before close if position in loss
 AUTO_EXIT_THRESHOLD  = -0.01       # exit if position is -1% at 2:45 PM
 AUTO_EXIT_TIME       = "15:25"     # time to check for same-day exit
-MAX_OPEN_TRADES      = 4           # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
-MAX_PER_SECTOR       = 2
+MAX_OPEN_TRADES      = 6           # max concurrent trades (1 now, 2 at month 3, 3 at month 5)
+MAX_PER_SECTOR       = 3
 NO_NEW_TRADE_BEFORE  = "09:30"     # wait 15 min for market to settle
 ALLOW_SHORTS         = False
 
 
 # ── XGBoost signal thresholds ───────────────────────────────
-#BUY_THRESHOLD        = 0.65
+BUY_THRESHOLD        = 0.60
 SELL_THRESHOLD       = 0.38
 
 
@@ -89,17 +89,17 @@ MOMENTUM_EXIT_MIN_CANDLES = 14     # 14 × 5 min = 70 min minimum hold
 
 
 # ── ML / volume filters ─────────────────────────────────────
-#MODEL_THRESHOLD   = 0.60
-MIN_VOLUME_RATIO  = 0.80
+MODEL_THRESHOLD   = 0.60
+MIN_VOLUME_RATIO  = 0.60
 MIN_ATR_PCT       = 0.0007
 
 
 # ── Entry quality filters ───────────────────────────────────
 REQUIRE_BREAKOUT_CONFIRMATION = False  # require close above EMA20 for buy signal
 
-MIN_VOLUME_RATIO_CONFIRM = 0.95
-MIN_CANDLE_BODY_PCT      = 0.001
-MAX_DISTANCE_FROM_EMA20  = 0.04
+MIN_VOLUME_RATIO_CONFIRM = 0.75
+MIN_CANDLE_BODY_PCT      = 0.0005
+MAX_DISTANCE_FROM_EMA20  = 0.06
 
 
 # ── Trend filters ───────────────────────────────────────────
@@ -118,12 +118,12 @@ NO_REENTRY_MINUTES     = 60
 
 # ── Momentum extension filter ───────────────────────────────
 # Avoid chasing huge candles already extended from VWAP
-MAX_DISTANCE_FROM_VWAP = 0.03
+MAX_DISTANCE_FROM_VWAP = 0.05
 
 
 # ── Time filters ────────────────────────────────────────────
 # Avoid lunchtime chop
-AVOID_LUNCH_HOURS      = True
+AVOID_LUNCH_HOURS      = False
 LUNCH_START            = "12:30"
 LUNCH_END              = "13:00"
 
