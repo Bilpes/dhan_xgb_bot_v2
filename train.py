@@ -2,7 +2,9 @@
 # train.py — dhan_xgb_bot_v2
 # Audit-patched 2026-06-28
 # Fix I6a: Final model n_estimators uses WF best_iteration+50 (was hardcoded 600)
-# Fix I6b: WF folds now fit+transform scaler per fold for consistent metric evaluation
+# Fix I6b: WF folds now fit+transform scaler per fold for consistent metric eval
+# Fix DATA: load_historical_data() now fetches from Dhan API when CSV not present,
+#           then caches to data/{SYMBOL}_5min.csv for faster subsequent retrains.
 #
 # Key invariants (unchanged):
 #   1. Label entry = open[t+1], NOT close[t]  — kills look-ahead leakage
@@ -13,9 +15,9 @@
 # ============================================================
 
 import pickle, logging, os
+from datetime import date, timedelta
 import numpy as np
 import pandas as pd
-from datetime import timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score
 from xgboost import XGBClassifier
@@ -28,12 +30,86 @@ log = logging.getLogger("train")
 
 
 # ── Data loader ──────────────────────────────────────────────────
-def load_historical_data(symbol: str) -> pd.DataFrame:
-    """Load 5-min OHLCV CSV from data/. Replace with Dhan API if needed."""
-    path = f"data/{symbol}_5min.csv"
-    df = pd.read_csv(path, parse_dates=["datetime"], index_col="datetime")
-    df.columns = [c.lower() for c in df.columns]
-    return df.sort_index()
+def load_historical_data(symbol: str, days: int = 90) -> pd.DataFrame:
+    """
+    Load 5-min OHLCV data for a symbol.
+
+    Priority:
+      1. Local CSV cache: data/{symbol}_5min.csv
+         — used if file exists (fast, no API call needed)
+      2. Dhan historical_minute_charts API
+         — fetches `days` of history, saves to CSV cache
+
+    After first fetch, subsequent retrains read from cache
+    and only hit the API once per week (or when CSV is stale).
+    """
+    os.makedirs("data", exist_ok=True)
+    path = os.path.join("data", f"{symbol}_5min.csv")
+
+    # ── 1. Try local CSV cache ────────────────────────────────
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, parse_dates=["datetime"], index_col="datetime")
+            df.columns = [c.lower() for c in df.columns]
+            df = df.sort_index()
+            if len(df) > 100:
+                log.debug(f"{symbol}: loaded {len(df)} rows from cache")
+                return df
+        except Exception as e:
+            log.warning(f"{symbol}: CSV cache corrupt ({e}), re-fetching from API")
+
+    # ── 2. Fetch from Dhan API ────────────────────────────────
+    if not cfg.DHAN_CLIENT_ID or not cfg.DHAN_ACCESS_TOKEN:
+        raise FileNotFoundError(
+            f"{symbol}: no local CSV and DHAN credentials not set. "
+            "Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN env vars, "
+            "or place CSV files in data/."
+        )
+
+    try:
+        from dhanhq import dhanhq
+        dhan = dhanhq(cfg.DHAN_CLIENT_ID, cfg.DHAN_ACCESS_TOKEN)
+
+        to_date   = date.today().strftime("%Y-%m-%d")
+        from_date = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        log.info(f"{symbol}: fetching {days}d from Dhan API ({from_date} → {to_date})")
+
+        resp = dhan.historical_minute_charts(
+            symbol          = symbol,
+            exchange_segment= "NSE_EQ",
+            instrument_type = "EQUITY",
+            expiry_code     = 0,
+            from_date       = from_date,
+            to_date         = to_date,
+        )
+
+        records = resp.get("data", {})
+        if not records or "timestamp" not in records:
+            raise ValueError(f"Empty response from Dhan API for {symbol}")
+
+        df = pd.DataFrame({
+            "datetime": pd.to_datetime(records["timestamp"]),
+            "open"    : records["open"],
+            "high"    : records["high"],
+            "low"     : records["low"],
+            "close"   : records["close"],
+            "volume"  : records["volume"],
+        }).set_index("datetime").sort_index()
+
+        # Filter to market hours only (9:15 AM – 3:30 PM)
+        df = df.between_time("09:15", "15:30")
+
+        if len(df) < 100:
+            raise ValueError(f"Insufficient data for {symbol}: only {len(df)} rows")
+
+        # Cache to CSV — subsequent retrains won't need API call
+        df.to_csv(path)
+        log.info(f"{symbol}: {len(df)} rows fetched and cached → {path}")
+        return df
+
+    except Exception as e:
+        raise FileNotFoundError(f"Dhan API fetch failed for {symbol}: {e}")
 
 
 # ── Label builder (LEAKAGE-FREE) ─────────────────────────────────
@@ -110,7 +186,12 @@ def prepare_dataset(symbols: list) -> pd.DataFrame:
             log.warning(f"Skipped {sym}: {e}")
 
     if not dfs:
-        raise RuntimeError("No data loaded — check data/ directory")
+        raise RuntimeError(
+            "No stock data loaded.\n"
+            "Either:\n"
+            "  a) Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN env vars, OR\n"
+            "  b) Place CSV files as data/{SYMBOL}_5min.csv"
+        )
 
     combined = pd.concat(dfs)
     combined = combined.dropna(subset=FEATURE_COLS + ["label"])
@@ -130,10 +211,10 @@ def walk_forward_train(
 ) -> tuple:
     """
     Walk-forward cross-validation with temporal embargo.
-    FIX I6b: Each fold now fits+transforms its own StandardScaler so that
+    Fix I6b: Each fold fits+transforms its own StandardScaler so that
     validation metrics reflect the same data transform used at production
-    inference. Previously, folds used raw features while the final model
-    used scaled features — making WF metrics inconsistent with live behaviour.
+    inference. Previously folds used raw features — making WF metrics
+    inconsistent with live behaviour.
     """
     df = df.sort_index()
     dates     = df.index.normalize().unique().sort_values()
@@ -162,9 +243,7 @@ def walk_forward_train(
                  f"val {val_start.date()}–{val_end.date()} | "
                  f"tr={len(tr)} va={len(va)} BUY%={pos/(neg+pos):.1%}")
 
-        # FIX I6b: fit scaler on fold train set, transform both train and val
-        # Previously: X_tr = tr[FEATURE_COLS].fillna(0)  ← raw, unscaled
-        # Now: scaler fitted per fold → WF metrics match production scaling
+        # Fix I6b: fit scaler on fold train set, transform both sets
         fold_scaler = StandardScaler()
         X_tr_raw = tr[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0).values
         X_va_raw = va[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0).values
@@ -193,7 +272,7 @@ def walk_forward_train(
         metrics.append({"fold": fold, "acc": acc, "auc": auc, "prec": prec, "best_iter": best_iter})
 
     if not models:
-        raise RuntimeError("All folds failed — check data quality")
+        raise RuntimeError("All WF folds failed — check data quality and MIN_TRAIN_SAMPLES")
 
     best = max(models, key=lambda x: x["auc"])
     return best["model"], pd.DataFrame(metrics), best["best_iter"]
@@ -201,12 +280,14 @@ def walk_forward_train(
 
 # ── Main entry point ─────────────────────────────────────────────
 def train_and_save(symbols: list = None):
-    from watchlist import ALL_SYMBOLS
-    symbols = symbols or ALL_SYMBOLS
+    from watchlist import ALL_SYMBOLS, get_watchlist
+    if symbols is None:
+        symbols = get_watchlist() or ALL_SYMBOLS
 
+    log.info(f"Training on {len(symbols)} symbols: {symbols}")
     df = prepare_dataset(symbols)
 
-    # FIX I6b: walk_forward_train now returns best_iter from WF folds
+    # Fix I6b: walk_forward_train returns best_iter from WF folds
     model, fold_metrics, wf_best_iter = walk_forward_train(
         df,
         n_folds=cfg.WALK_FORWARD_FOLDS,
@@ -227,22 +308,20 @@ def train_and_save(symbols: list = None):
     if mean_prec < cfg.MIN_PRECISION:
         raise ValueError(f"Precision gate failed: {mean_prec:.3f} < {cfg.MIN_PRECISION}")
 
-    # FIX I6a: was n_estimators=600 hardcoded, ignoring WF best_iteration
-    # Now: n_final = wf_best_iter + 50
-    #   +50 buffer: full dataset is larger than any single fold's train set,
-    #   so optimal stopping point shifts slightly later — 50 trees is sufficient.
-    #   Hard cap at 700 to prevent runaway on very large datasets.
+    # Fix I6a: was n_estimators=600 hardcoded, ignoring WF best_iteration
+    # n_final = wf_best_iter + 50 buffer (full dataset shifts optimum slightly later)
+    # Hard cap at 700 to prevent runaway on very large datasets.
     n_final = min(wf_best_iter + 50, 700)
     log.info(f"Final model n_estimators={n_final} (wf_best_iter={wf_best_iter} + 50 buffer)")
 
-    scaler = StandardScaler()
-    X_all  = df[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
+    scaler   = StandardScaler()
+    X_all    = df[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
     X_all_sc = scaler.fit_transform(X_all)
 
     neg = (df["label"] == 0).sum()
     pos = (df["label"] == 1).sum()
     final_mdl = XGBClassifier(
-        n_estimators=n_final,   # FIX I6a: was hardcoded 600
+        n_estimators=n_final,
         max_depth=5, learning_rate=0.03,
         subsample=0.75, colsample_bytree=0.75, min_child_weight=5,
         gamma=0.1, reg_alpha=0.1, reg_lambda=1.5,
@@ -250,7 +329,6 @@ def train_and_save(symbols: list = None):
         use_label_encoder=False, eval_metric="auc",
         random_state=42, n_jobs=-1,
     )
-    # FIX I6a: n_final already validated by WF — no eval_set needed
     final_mdl.fit(X_all_sc, df["label"])
 
     os.makedirs("models", exist_ok=True)
@@ -258,7 +336,10 @@ def train_and_save(symbols: list = None):
     with open(cfg.SCALER_PATH,  "wb") as f: pickle.dump(scaler,       f)
     with open(cfg.FEATURE_PATH, "wb") as f: pickle.dump(FEATURE_COLS, f)
 
-    log.info(f"Model saved: {n_final} trees | scaler | {len(FEATURE_COLS)} features ✓")
+    log.info(
+        f"Model saved: {n_final} trees | scaler | {len(FEATURE_COLS)} features\n"
+        f"AUC={mean_auc:.3f} ACC={mean_acc:.3f} PREC={mean_prec:.3f} ✓"
+    )
     return final_mdl, scaler
 
 

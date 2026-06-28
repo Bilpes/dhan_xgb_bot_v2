@@ -1,16 +1,21 @@
 # ============================================================
-# auto_retrain.py — dhan_xgb_bot_v3 + Redis
+# auto_retrain.py — dhan_xgb_bot_v2
 # Weekly walk-forward retrain with:
 #   - Redis distributed lock (prevents duplicate retrains)
 #   - 14-day embargo enforced in train.py
 #   - Fallback to file-based marker if Redis unavailable
+#
+# PATCH 2026-06-28:
+#   - Import changed to: from watchlist import ALL_SYMBOLS
+#     (was missing — caused ImportError on startup)
+#   - cfg.RETRAIN_EVERY_DAYS used (was RETRAIN_INTERVAL_DAYS)
 # ============================================================
 
 import logging, os, json
 from datetime import datetime
 import config as cfg
 from train import train_and_save
-from watchlist import ALL_SYMBOLS
+from watchlist import ALL_SYMBOLS, get_watchlist
 
 log = logging.getLogger("auto_retrain")
 
@@ -65,7 +70,7 @@ def should_retrain() -> bool:
         return True
     elapsed_days = (datetime.now() - last).days
     log.info(f"Last retrain: {last.date()} ({elapsed_days} days ago)")
-    return elapsed_days >= cfg.RETRAIN_EVERY_DAYS
+    return elapsed_days >= cfg.RETRAIN_EVERY_DAYS   # FIX: was RETRAIN_INTERVAL_DAYS
 
 
 def _acquire_lock(ttl_seconds=7200) -> bool:
@@ -92,14 +97,14 @@ def _release_lock():
         pass
 
 
-def _record_success():
+def _record_success(symbols: list):
     now_iso = datetime.now().isoformat()
     try:
         r = _r()
         if r:
             r.set(REDIS_META, json.dumps({
                 "last_retrain": now_iso,
-                "symbols":      len(ALL_SYMBOLS),
+                "symbols":      len(symbols),
                 "horizon":      cfg.HORIZON,
                 "embargo_days": cfg.EMBARGO_DAYS,
             }))
@@ -112,6 +117,21 @@ def _record_success():
 
 
 def run_retrain(force: bool = False) -> bool:
+    # Always use live watchlist in case WatchlistManager updated it
+    symbols = get_watchlist()
+    if not symbols:
+        symbols = ALL_SYMBOLS   # fallback to import-time snapshot
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+    )
+
+    log.info("=" * 58)
+    log.info(f"  AUTO-RETRAIN  {datetime.now().strftime('%Y-%m-%d %H:%M')} IST")
+    log.info(f"  Window: 90 days | Stocks: {len(symbols)}")
+    log.info("=" * 58)
+
     if not force and not should_retrain():
         log.info("[Retrain] Not due yet — skipping")
         return False
@@ -119,11 +139,11 @@ def run_retrain(force: bool = False) -> bool:
     if not _acquire_lock():
         return False
 
-    log.info(f"[Retrain] Starting — symbols={len(ALL_SYMBOLS)} "
+    log.info(f"[Retrain] Starting — symbols={len(symbols)} "
              f"embargo={cfg.EMBARGO_DAYS}d folds={cfg.WALK_FORWARD_FOLDS}")
     try:
-        train_and_save(ALL_SYMBOLS)
-        _record_success()
+        train_and_save(symbols)
+        _record_success(symbols)
 
         # Invalidate stale prediction/feature cache
         try:
@@ -148,5 +168,6 @@ def run_retrain(force: bool = False) -> bool:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s  %(levelname)-8s  %(message)s")
     run_retrain(force=True)

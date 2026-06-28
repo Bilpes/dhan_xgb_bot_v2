@@ -9,12 +9,10 @@
 #   BLOCKED_SYMBOLS: list[str]  — never traded, never added by WM
 #   ALT_USED       : dict       — symbol → API alt name override
 #
-# OODA change 2026-06-28:
-#   - SECTOR_MAP and BLOCKED_SYMBOLS now loaded FROM JSON
-#     so watchlist.json is the single source of truth.
-#   - get_security_id() added for Dhan API calls.
-#   - _refresh_static() lets WatchlistManager hot-refresh
-#     module-level vars after atomic JSON write.
+# PATCH 2026-06-28:
+#   - ALL_SYMBOLS added as module-level list alias for train.py / auto_retrain.py
+#   - get_watchlist() remains the live OODA-safe reader (re-reads JSON every call)
+#   - ALL_SYMBOLS is a snapshot at import time — safe for training loops
 # =============================================================
 
 import json
@@ -51,22 +49,23 @@ def _load_json() -> dict:
 
 
 # ── universe helpers ───────────────────────────────────────
-def get_watchlist() -> list[str]:
+def get_watchlist() -> list:
     """
     Combined tier_a + tier_b, deduped, in scan priority order.
     Called on every scan tick — always reflects the live JSON.
+    Safe for bot.py OODA loop (re-reads watchlist.json on every call).
     """
     data = _load_json()
     combined = data.get("tier_a", []) + data.get("tier_b", [])
     return list(dict.fromkeys(combined))  # preserve order, dedup
 
 
-def get_tier_a() -> list[str]:
+def get_tier_a() -> list:
     """Tier A stocks — scanned from 09:20 AM."""
     return list(_load_json().get("tier_a", []))
 
 
-def get_tier_b() -> list[str]:
+def get_tier_b() -> list:
     """Tier B stocks — scanned from 10:00 AM."""
     return list(_load_json().get("tier_b", []))
 
@@ -89,24 +88,30 @@ def is_tradeable(symbol: str) -> bool:
 # ── module-level static copies (fast in-process lookups) ──
 # Source of truth is watchlist.json.  Call _refresh_static()
 # after any JSON write to sync these without restarting.
-def _build_sector_map() -> dict[str, str]:
+def _build_sector_map() -> dict:
     return {k: v.upper() for k, v in _load_json().get("SECTOR_MAP", {}).items()}
 
 
-def _build_blocked() -> list[str]:
+def _build_blocked() -> list:
     return _load_json().get("BLOCKED_SYMBOLS", [])
 
 
-SECTOR_MAP: dict[str, str] = _build_sector_map()
-BLOCKED_SYMBOLS: list[str] = _build_blocked()
+SECTOR_MAP:      dict = _build_sector_map()
+BLOCKED_SYMBOLS: list = _build_blocked()
+
+# ── ALL_SYMBOLS — snapshot alias used by train.py / auto_retrain.py ──
+# This is a list captured at import time — stable for training loops.
+# bot.py uses get_watchlist() (live) instead of this.
+# If watchlist.json changes mid-session, re-import or call get_watchlist().
+ALL_SYMBOLS: list = get_watchlist()
 
 
 def _refresh_static() -> None:
     """
-    Hot-refresh SECTOR_MAP + BLOCKED_SYMBOLS after
+    Hot-refresh SECTOR_MAP + BLOCKED_SYMBOLS + ALL_SYMBOLS after
     WatchlistManager._write_watchlist() atomically updates JSON.
     Call this at the end of every WM write so the live bot
-    sees sector changes without a restart.
+    sees sector/universe changes without a restart.
 
     Usage in watchlist_manager.py:
         from watchlist import _refresh_static
@@ -114,6 +119,7 @@ def _refresh_static() -> None:
         self._write_watchlist(new_data)
         _refresh_static()
     """
-    global SECTOR_MAP, BLOCKED_SYMBOLS
+    global SECTOR_MAP, BLOCKED_SYMBOLS, ALL_SYMBOLS
     SECTOR_MAP      = _build_sector_map()
     BLOCKED_SYMBOLS = _build_blocked()
+    ALL_SYMBOLS     = get_watchlist()
