@@ -1,6 +1,16 @@
 # config.py — dhan_xgb_bot_v2 / v3
 # All tunable parameters in one place.
 # ───────────────────────────────────────────────────────────────
+# PATCH 2026-06-28 v3.3 (Gap B — sector split):
+#   ENERGY_INFRA (7 stocks, MAX_PER_SECTOR=3) split into:
+#     ENERGY        : RELIANCE, NTPC, POWERGRID   (3 stocks)
+#     DEFENCE_INFRA : LT, HAL, BEL, CGPOWER       (4 stocks)
+#   With the old single-bucket layout, up to 4 valid signals were
+#   silently blocked every session when 3 ENERGY_INFRA slots filled.
+#   Now each sub-sector gets its own 3-slot budget.
+#   config.py comment updated.  watchlist.json SECTOR_MAP updated.
+#   No logic change in this file — sector names come from watchlist.json.
+#
 # PATCH 2026-06-28 v3.2 (trade_manager crash fix):
 #   Added 5 constants that trade_manager.py references but were missing:
 #     TOTAL_CAPITAL              — total risk capital for sizing + daily loss gate
@@ -22,6 +32,19 @@
 #  10. RETRAIN_EVERY_DAYS, WALK_FORWARD_FOLDS, MIN_TRAIN_SAMPLES added
 #  11. MIN_ACCURACY, MIN_PRECISION renamed from MIN_ACC/MIN_PREC (both kept)
 #  12. TELEGRAM_BOT_TOKEN alias added
+# ───────────────────────────────────────────────────────────────
+#
+# Active sector schema (9 sectors, from watchlist.json SECTOR_MAP):
+#   BANKING        (6)  ICICIBANK HDFCBANK AXISBANK SBIN KOTAKBANK INDUSINDBK
+#   FINANCE        (3)  BAJFINANCE BAJAJFINSV CHOLAFIN
+#   IT             (7)  TCS INFY HCLTECH WIPRO TECHM LTIM PERSISTENT
+#   AUTO           (3)  TATAMOTORS MARUTI M&M
+#   PHARMA         (3)  SUNPHARMA DRREDDY APOLLOHOSP
+#   ENERGY         (3)  RELIANCE NTPC POWERGRID              ← was ENERGY_INFRA
+#   DEFENCE_INFRA  (4)  LT HAL BEL CGPOWER                  ← new split bucket
+#   TELECOM        (1)  BHARTIARTL
+#   CONSUMER       (5)  ETERNAL TRENT TITAN IRCTC HAVELLS
+#   METALS_REALTY  (3)  JSWSTEEL DLF ADANIPORTS
 # ───────────────────────────────────────────────────────────────
 
 import os
@@ -90,6 +113,9 @@ TRAILING_SL_TRAIL_MULT    = 0.8   # trail at 0.8×ATR below peak (tight but not 
 # ── Position limits ──────────────────────────────────────────
 MAX_OPEN_POSITIONS   = 6        # FIX v3.1: was 4
 MAX_PER_SECTOR       = 3        # FIX v3.1: was 2
+                                 # NOTE v3.3: ENERGY_INFRA split into ENERGY (3) +
+                                 # DEFENCE_INFRA (4) so each gets its own 3-slot budget.
+                                 # No change to this constant needed.
 MIN_STOCK_PRICE      = 50.0
 
 # ── Volume gates ───────────────────────────────────────────
