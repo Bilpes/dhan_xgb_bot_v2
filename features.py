@@ -1,4 +1,10 @@
-# features.py — dhan_xgb_bot_v3
+# features.py — dhan_xgb_bot_v2
+# Audit-patched 2026-06-28
+# Fix I5: Added 4 high-MI features:
+#   orb_break       — Opening Range Breakout flag (top-3 NSE intraday signal)
+#   beta_residual_5c — Stock-specific momentum (removes index noise)
+#   atr_expansion    — Volatility regime flag (breakout context)
+#   consec_green     — Consecutive green candles (momentum continuation)
 # LEAKAGE-FREE feature engineering + label construction
 # KEY FIX: labels use open[t+1] as entry price, NOT close[t]
 
@@ -34,9 +40,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── MACD ─────────────────────────────────────────────────────────
     macd = ta.trend.MACD(c, 26, 12, 9)
-    df["macd"]           = macd.macd()
-    df["macd_signal"]    = macd.macd_signal()
-    df["macd_hist"]      = macd.macd_diff()
+    df["macd"]            = macd.macd()
+    df["macd_signal"]     = macd.macd_signal()
+    df["macd_hist"]       = macd.macd_diff()
     df["macd_hist_slope"] = df["macd_hist"].diff(2)
 
     # ── Stochastic ───────────────────────────────────────────────────
@@ -60,11 +66,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_pct"]   = bb.bollinger_pband()
 
     # ── Volume ───────────────────────────────────────────────────────
-    df["vol_ma20"]   = v.rolling(20).mean()
-    df["vol_ratio"]  = v / df["vol_ma20"]
+    df["vol_ma20"]    = v.rolling(20).mean()
+    df["vol_ratio"]   = v / df["vol_ma20"]
     df["vol_ratio_5"] = v.rolling(5).mean() / df["vol_ma20"]
-    df["obv"]       = ta.volume.on_balance_volume(c, v)
-    df["obv_slope"] = df["obv"].diff(5) / df["obv"].shift(5).abs()
+    df["obv"]         = ta.volume.on_balance_volume(c, v)
+    df["obv_slope"]   = df["obv"].diff(5) / df["obv"].shift(5).abs()
 
     # ── VWAP — feature only, NOT a hard filter ───────────────────────
     cum_vol = v.groupby(df.index.date).cumsum()
@@ -77,7 +83,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["candle_body"]      = (c - o) / o
     df["candle_wick_up"]   = (h - c.clip(lower=o))  / (h - l + 1e-6)
     df["candle_wick_down"] = (c.clip(upper=o) - l)  / (h - l + 1e-6)
-    df["is_green"]   = (c > o).astype(int)
+    df["is_green"]    = (c > o).astype(int)
     df["prev_return"] = c.pct_change()
     df["gap_up"]      = (o - c.shift(1)) / c.shift(1)
     df["high_break"]  = (c > h.shift(1)).astype(int)
@@ -94,6 +100,45 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["nifty_ret_5c"] = 0.0
     if "nifty_above_ema20" not in df.columns:
         df["nifty_above_ema20"] = 1
+
+    # ── FIX I5: New high-MI features ─────────────────────────────────
+
+    # 1. Opening Range Breakout flag
+    #    ORB high = max(high) of first 3 candles per day (9:15–9:30)
+    #    session_min==0 is 9:15, ==5 is 9:20, ==10 is 9:25
+    #    Candles 0,1,2 → session_min 0,5,10
+    orb_mask = df["session_min"] <= 10
+    orb_high = (
+        df["high"]
+        .where(orb_mask)
+        .groupby(df.index.date)
+        .transform("max")
+    )
+    df["orb_break"] = (c > orb_high).astype(int)
+
+    # 2. Beta-adjusted residual return (5-candle)
+    #    Removes index co-movement; captures stock-specific alpha.
+    #    beta estimated as rolling 20-candle cov/var.
+    nifty_ret = df["nifty_ret_5c"].fillna(0)
+    stock_ret = df["ret_5c"].fillna(0)
+    roll_cov  = stock_ret.rolling(20).cov(nifty_ret)
+    roll_var  = nifty_ret.rolling(20).var().replace(0, 1e-9)
+    beta_roll = (roll_cov / roll_var).clip(-3.0, 3.0).fillna(0)
+    df["beta_residual_5c"] = (stock_ret - beta_roll * nifty_ret).fillna(0)
+
+    # 3. ATR expansion ratio — volatility regime
+    #    > 1.2 = expanding volatility (breakout context)
+    #    < 0.8 = compressed volatility (consolidation/low signal)
+    atr_roll_mean = df["atr14"].rolling(20).mean().replace(0, 1e-9)
+    df["atr_expansion"] = (df["atr14"] / atr_roll_mean).clip(0.3, 3.0).fillna(1.0)
+
+    # 4. Consecutive green candles — momentum continuation signal
+    #    Resets to 0 on any red candle. Clipped at 8 to avoid outlier leverage.
+    green = df["is_green"]
+    streak_id = (green != green.shift()).cumsum()
+    df["consec_green"] = (
+        green.groupby(streak_id).cumcount().where(green == 1, 0).clip(0, 8)
+    )
 
     return df
 
@@ -136,11 +181,11 @@ def build_labels(
         sl_idx = fut[fut["low"]  <= sl].index
 
         if len(tp_idx) == 0 and len(sl_idx) == 0:
-            labels.append(0)   # neither hit within horizon
+            labels.append(0)
         elif len(tp_idx) == 0:
-            labels.append(0)   # only SL hit
+            labels.append(0)
         elif len(sl_idx) == 0:
-            labels.append(1)   # only TP hit
+            labels.append(1)
         else:
             labels.append(1 if tp_idx[0] <= sl_idx[0] else 0)
 
@@ -149,6 +194,7 @@ def build_labels(
 
 
 # Canonical feature column list — must match exactly between train and signal
+# FIX I5: Added orb_break, beta_residual_5c, atr_expansion, consec_green (44 total)
 FEATURE_COLS = [
     "ema9_21_cross", "ema21_50_cross", "price_above_ema50", "price_above_ema200",
     "ema9_slope", "ema21_slope",
@@ -164,4 +210,9 @@ FEATURE_COLS = [
     "ret_3c", "ret_5c", "ret_10c",
     "hour", "session_min",
     "nifty_ret_5c", "nifty_above_ema20",
+    # FIX I5: new high-MI features
+    "orb_break",          # Opening Range Breakout — top-3 NSE intraday signal
+    "beta_residual_5c",   # Stock alpha after removing NIFTY beta noise
+    "atr_expansion",      # Volatility regime: >1.2=breakout, <0.8=consolidation
+    "consec_green",       # Consecutive green candles (0-8)
 ]

@@ -1,5 +1,8 @@
 # ============================================================
-# signal_engine.py — dhan_xgb_bot_v3 + Redis
+# signal_engine.py — dhan_xgb_bot_v2
+# Audit-patched 2026-06-28
+# Fix I7: CSV header now checked at write time via _needs_header()
+#         Prevents headerless scan-log rows if file deleted mid-session
 # BUY signal generator with Redis feature/prediction caching,
 # cooldown enforcement, circuit-breaker, and duplicate-order guard
 # ============================================================
@@ -83,7 +86,20 @@ class SignalEngine:
         self.features = FEATURE_COLS
         self._load_model()
         os.makedirs(os.path.dirname(cfg.SIGNAL_LOG_PATH), exist_ok=True)
-        self._hdr = os.path.exists(cfg.SIGNAL_LOG_PATH)
+        # FIX I7: removed self._hdr = os.path.exists(...) — stale state bug
+        # Header is now checked at write time via _needs_header()
+
+    # ── CSV header helper ────────────────────────────────────────────
+    @staticmethod
+    def _needs_header(path: str) -> bool:
+        """
+        FIX I7: Check file size at write time — not at init.
+        Returns True if the file does not exist or is empty (header needed).
+        """
+        try:
+            return not os.path.exists(path) or os.path.getsize(path) == 0
+        except OSError:
+            return True
 
     # ── Model I/O ───────────────────────────────────────────────
     def _load_model(self):
@@ -287,11 +303,12 @@ class SignalEngine:
             "target":        result["target"],
             "reject_reason": result.get("reject_reason", ""),
         }
+        # FIX I7: check header at write time, not at init
+        write_header = self._needs_header(cfg.SIGNAL_LOG_PATH)
         pd.DataFrame([row]).to_csv(
             cfg.SIGNAL_LOG_PATH, mode="a",
-            header=not self._hdr, index=False
+            header=write_header, index=False
         )
-        self._hdr = True
 
 
 # ── Nifty regime (cached in Redis) ──────────────────────────────

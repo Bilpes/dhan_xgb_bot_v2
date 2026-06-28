@@ -1,7 +1,11 @@
 # ============================================================
-# train.py — dhan_xgb_bot_v3 + anti-leakage
-# Key fixes vs v2:
-#   1. Label entry = open[t+1], NOT close[t]  ← kills look-ahead leakage
+# train.py — dhan_xgb_bot_v2
+# Audit-patched 2026-06-28
+# Fix I6a: Final model n_estimators uses WF best_iteration+50 (was hardcoded 600)
+# Fix I6b: WF folds now fit+transform scaler per fold for consistent metric evaluation
+#
+# Key invariants (unchanged):
+#   1. Label entry = open[t+1], NOT close[t]  — kills look-ahead leakage
 #   2. 14-day embargo between train-end and val-start
 #   3. Raw XGBoost prob — no clipping/capping
 #   4. Walk-forward with best-AUC fold selection
@@ -124,6 +128,13 @@ def walk_forward_train(
     n_folds: int = 5,
     embargo_days: int = 14,
 ) -> tuple:
+    """
+    Walk-forward cross-validation with temporal embargo.
+    FIX I6b: Each fold now fits+transforms its own StandardScaler so that
+    validation metrics reflect the same data transform used at production
+    inference. Previously, folds used raw features while the final model
+    used scaled features — making WF metrics inconsistent with live behaviour.
+    """
     df = df.sort_index()
     dates     = df.index.normalize().unique().sort_values()
     N         = len(dates)
@@ -151,6 +162,15 @@ def walk_forward_train(
                  f"val {val_start.date()}–{val_end.date()} | "
                  f"tr={len(tr)} va={len(va)} BUY%={pos/(neg+pos):.1%}")
 
+        # FIX I6b: fit scaler on fold train set, transform both train and val
+        # Previously: X_tr = tr[FEATURE_COLS].fillna(0)  ← raw, unscaled
+        # Now: scaler fitted per fold → WF metrics match production scaling
+        fold_scaler = StandardScaler()
+        X_tr_raw = tr[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0).values
+        X_va_raw = va[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0).values
+        X_tr = fold_scaler.fit_transform(X_tr_raw)
+        X_va = fold_scaler.transform(X_va_raw)
+
         mdl = XGBClassifier(
             n_estimators=500, max_depth=5, learning_rate=0.03,
             subsample=0.75, colsample_bytree=0.75, min_child_weight=5,
@@ -159,9 +179,6 @@ def walk_forward_train(
             use_label_encoder=False, eval_metric="auc",
             early_stopping_rounds=30, random_state=42, n_jobs=-1,
         )
-
-        X_tr = tr[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
-        X_va = va[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
         mdl.fit(X_tr, tr["label"], eval_set=[(X_va, va["label"])], verbose=False)
 
         proba = mdl.predict_proba(X_va)[:, 1]
@@ -169,16 +186,17 @@ def walk_forward_train(
         acc   = accuracy_score(va["label"], preds)
         auc   = roc_auc_score(va["label"], proba)
         prec  = precision_score(va["label"], preds, zero_division=0)
-        log.info(f"Fold {fold}: acc={acc:.3f} auc={auc:.3f} prec={prec:.3f}")
+        best_iter = getattr(mdl, "best_iteration", 500)
+        log.info(f"Fold {fold}: acc={acc:.3f} auc={auc:.3f} prec={prec:.3f} best_iter={best_iter}")
 
-        models.append({"model": mdl, "auc": auc, "acc": acc, "prec": prec})
-        metrics.append({"fold": fold, "acc": acc, "auc": auc, "prec": prec})
+        models.append({"model": mdl, "auc": auc, "acc": acc, "prec": prec, "best_iter": best_iter})
+        metrics.append({"fold": fold, "acc": acc, "auc": auc, "prec": prec, "best_iter": best_iter})
 
     if not models:
         raise RuntimeError("All folds failed — check data quality")
 
     best = max(models, key=lambda x: x["auc"])
-    return best["model"], pd.DataFrame(metrics)
+    return best["model"], pd.DataFrame(metrics), best["best_iter"]
 
 
 # ── Main entry point ─────────────────────────────────────────────
@@ -188,7 +206,8 @@ def train_and_save(symbols: list = None):
 
     df = prepare_dataset(symbols)
 
-    model, fold_metrics = walk_forward_train(
+    # FIX I6b: walk_forward_train now returns best_iter from WF folds
+    model, fold_metrics, wf_best_iter = walk_forward_train(
         df,
         n_folds=cfg.WALK_FORWARD_FOLDS,
         embargo_days=cfg.EMBARGO_DAYS,
@@ -198,6 +217,7 @@ def train_and_save(symbols: list = None):
     mean_acc  = fold_metrics["acc"].mean()
     mean_prec = fold_metrics["prec"].mean()
     log.info(f"Walk-forward mean: AUC={mean_auc:.3f} ACC={mean_acc:.3f} PREC={mean_prec:.3f}")
+    log.info(f"WF best_iteration (best AUC fold): {wf_best_iter}")
     log.info(f"\n{fold_metrics.to_string()}")
 
     if mean_auc  < cfg.MIN_AUC:
@@ -207,28 +227,38 @@ def train_and_save(symbols: list = None):
     if mean_prec < cfg.MIN_PRECISION:
         raise ValueError(f"Precision gate failed: {mean_prec:.3f} < {cfg.MIN_PRECISION}")
 
+    # FIX I6a: was n_estimators=600 hardcoded, ignoring WF best_iteration
+    # Now: n_final = wf_best_iter + 50
+    #   +50 buffer: full dataset is larger than any single fold's train set,
+    #   so optimal stopping point shifts slightly later — 50 trees is sufficient.
+    #   Hard cap at 700 to prevent runaway on very large datasets.
+    n_final = min(wf_best_iter + 50, 700)
+    log.info(f"Final model n_estimators={n_final} (wf_best_iter={wf_best_iter} + 50 buffer)")
+
     scaler = StandardScaler()
     X_all  = df[FEATURE_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
-    scaler.fit(X_all)
+    X_all_sc = scaler.fit_transform(X_all)
 
     neg = (df["label"] == 0).sum()
     pos = (df["label"] == 1).sum()
     final_mdl = XGBClassifier(
-        n_estimators=600, max_depth=5, learning_rate=0.03,
+        n_estimators=n_final,   # FIX I6a: was hardcoded 600
+        max_depth=5, learning_rate=0.03,
         subsample=0.75, colsample_bytree=0.75, min_child_weight=5,
         gamma=0.1, reg_alpha=0.1, reg_lambda=1.5,
         scale_pos_weight=neg / max(pos, 1),
         use_label_encoder=False, eval_metric="auc",
         random_state=42, n_jobs=-1,
     )
-    final_mdl.fit(X_all, df["label"])
+    # FIX I6a: n_final already validated by WF — no eval_set needed
+    final_mdl.fit(X_all_sc, df["label"])
 
     os.makedirs("models", exist_ok=True)
     with open(cfg.MODEL_PATH,   "wb") as f: pickle.dump(final_mdl,    f)
     with open(cfg.SCALER_PATH,  "wb") as f: pickle.dump(scaler,       f)
     with open(cfg.FEATURE_PATH, "wb") as f: pickle.dump(FEATURE_COLS, f)
 
-    log.info("Model, scaler, features saved ✓")
+    log.info(f"Model saved: {n_final} trees | scaler | {len(FEATURE_COLS)} features ✓")
     return final_mdl, scaler
 
 

@@ -1,5 +1,9 @@
-# trade_manager.py — dhan_xgb_bot_v3
-# Risk-based position sizing, trailing SL, PnL tracking
+# trade_manager.py — dhan_xgb_bot_v2
+# Audit-patched 2026-06-28
+# Fix I7: CSV header now checked at write time via _needs_header() — not at init
+#         Prevents headerless rows if file is deleted/rotated mid-session
+# Fix I8: compute_qty now caps single position at 25% of TOTAL_CAPITAL
+#         Prevents capital overflow for high-price stocks (MARUTI ₹13k, etc.)
 
 import logging
 import os
@@ -35,7 +39,8 @@ class TradeManager:
         self.positions: Dict[str, Position] = {}
         self.daily_pnl = 0.0
         os.makedirs(os.path.dirname(cfg.TRADE_LOG_PATH), exist_ok=True)
-        self._hdr = os.path.exists(cfg.TRADE_LOG_PATH)
+        # FIX I7: removed self._hdr = os.path.exists(...) — stale state bug
+        # Header is now checked at write time via _needs_header()
 
     def reset_daily(self):
         """Call at session start to clear daily P&L counter."""
@@ -70,8 +75,26 @@ class TradeManager:
 
     # ── Sizing ───────────────────────────────────────────────────────
     def compute_qty(self, entry: float, sl: float) -> int:
+        """
+        Risk-based position sizing.
+        FIX I8: Added 25% capital cap guard.
+
+        Without the cap, high-price stocks can cause capital overflow:
+          Example — MARUTI at ₹13,000, ATR=₹60:
+            qty = int(500000 * 0.005 / 60) = 41
+            position_value = 41 * 13000 = ₹533,000 > TOTAL_CAPITAL ₹500,000
+
+        Fix: single position capped at TOTAL_CAPITAL * 0.25 = ₹125,000
+          MARUTI: max_qty = int(125000 / 13000) = 9 shares → safe
+        """
         risk_per_share = max(entry - sl, entry * cfg.MIN_SL_PCT)
-        qty = int(cfg.TOTAL_CAPITAL * cfg.RISK_PER_TRADE / risk_per_share)
+        raw_qty        = int(cfg.TOTAL_CAPITAL * cfg.RISK_PER_TRADE / risk_per_share)
+
+        # FIX I8: cap at 25% of total capital per position
+        max_position_value = cfg.TOTAL_CAPITAL * 0.25
+        max_qty_by_capital = int(max_position_value / max(entry, 1))
+
+        qty = min(raw_qty, max_qty_by_capital)
         return max(qty, 1)
 
     # ── Entry ────────────────────────────────────────────────────────
@@ -129,7 +152,6 @@ class TradeManager:
         if not pos:
             return
         pos.peak_price = max(pos.peak_price, price)
-        # Activate when price is 1x ATR above entry
         if pos.peak_price >= pos.entry_price + cfg.TRAILING_SL_ACTIVATE_MULT * pos.atr:
             pos.trailing_sl_active = True
         if pos.trailing_sl_active:
@@ -187,6 +209,21 @@ class TradeManager:
             pos.sl, pos.target, pos.prob, pnl, reason,
         )
 
+    # ── CSV header helper ────────────────────────────────────────────
+    @staticmethod
+    def _needs_header(path: str) -> bool:
+        """
+        FIX I7: Check file size at write time — not at init.
+        Returns True if the file does not exist or is empty (header needed).
+        The old pattern (self._hdr = os.path.exists(...) at __init__) had a
+        stale-state bug: if the file was deleted mid-session, _hdr remained
+        True and the next write would produce a headerless CSV row.
+        """
+        try:
+            return not os.path.exists(path) or os.path.getsize(path) == 0
+        except OSError:
+            return True
+
     # ── CSV trade log ────────────────────────────────────────────────
     def _log(
         self,
@@ -194,22 +231,22 @@ class TradeManager:
         pnl=None, reason=None,
     ):
         row = {
-            "time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mode":       "PAPER" if cfg.PAPER_MODE else "LIVE",
-            "symbol":     symbol,
-            "action":     action,
-            "qty":        qty,
-            "price":      price,
-            "sl":         sl,
-            "target":     target,
-            "prob":       round(prob, 4),
-            "pnl":        round(pnl, 2) if pnl is not None else "",
+            "time":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mode":        "PAPER" if cfg.PAPER_MODE else "LIVE",
+            "symbol":      symbol,
+            "action":      action,
+            "qty":         qty,
+            "price":       price,
+            "sl":          sl,
+            "target":      target,
+            "prob":        round(prob, 4),
+            "pnl":         round(pnl, 2) if pnl is not None else "",
             "exit_reason": reason or "",
-            "daily_pnl":  round(self.daily_pnl, 2),
+            "daily_pnl":   round(self.daily_pnl, 2),
         }
         with open(cfg.TRADE_LOG_PATH, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=row.keys())
-            if not self._hdr:
+            # FIX I7: check header at write time, not at init
+            if self._needs_header(cfg.TRADE_LOG_PATH):
                 w.writeheader()
-                self._hdr = True
             w.writerow(row)
