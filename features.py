@@ -1,12 +1,20 @@
 # features.py — dhan_xgb_bot_v2
-# Audit-patched 2026-06-28
-# Fix I5: Added 4 high-MI features:
-#   orb_break       — Opening Range Breakout flag (top-3 NSE intraday signal)
-#   beta_residual_5c — Stock-specific momentum (removes index noise)
-#   atr_expansion    — Volatility regime flag (breakout context)
-#   consec_green     — Consecutive green candles (momentum continuation)
-# LEAKAGE-FREE feature engineering + label construction
-# KEY FIX: labels use open[t+1] as entry price, NOT close[t]
+# =============================================================
+# PATCH 2026-06-28 (audit pass 2):
+#   ISSUE-8: Renamed features.build_labels → features._legacy_build_labels
+#            to prevent accidental import of the simpler close-only label
+#            builder. train.py uses its own build_labels (correct: high/low
+#            touch-order check). This file's version is kept only for reference.
+#
+# PATCH 2026-06-28 (audit pass 1):
+#   Fix I5: Added 4 high-MI features:
+#     orb_break        — Opening Range Breakout flag (top-3 NSE intraday signal)
+#     beta_residual_5c — Stock-specific momentum (removes index noise)
+#     atr_expansion    — Volatility regime flag (breakout context)
+#     consec_green     — Consecutive green candles (momentum continuation)
+# LEAKAGE-FREE feature engineering.
+# KEY RULE: labels use open[t+1] as entry price, NOT close[t].
+# =============================================================
 
 import numpy as np
 import pandas as pd
@@ -22,12 +30,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l, o, v = df["close"], df["high"], df["low"], df["open"], df["volume"]
 
     # ── EMA trend ────────────────────────────────────────────────────
-    df["ema9"]  = ta.trend.ema_indicator(c, 9)
-    df["ema21"] = ta.trend.ema_indicator(c, 21)
-    df["ema50"] = ta.trend.ema_indicator(c, 50)
+    df["ema9"]   = ta.trend.ema_indicator(c, 9)
+    df["ema21"]  = ta.trend.ema_indicator(c, 21)
+    df["ema50"]  = ta.trend.ema_indicator(c, 50)
     df["ema200"] = ta.trend.ema_indicator(c, 200)
-    df["ema9_21_cross"]   = (df["ema9"]  > df["ema21"]).astype(int)
-    df["ema21_50_cross"]  = (df["ema21"] > df["ema50"]).astype(int)
+    df["ema9_21_cross"]     = (df["ema9"]  > df["ema21"]).astype(int)
+    df["ema21_50_cross"]    = (df["ema21"] > df["ema50"]).astype(int)
     df["price_above_ema50"]  = (c > df["ema50"]).astype(int)
     df["price_above_ema200"] = (c > df["ema200"]).astype(int)
     df["ema9_slope"]  = df["ema9"].diff(3)  / df["ema9"].shift(3)
@@ -47,8 +55,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Stochastic ───────────────────────────────────────────────────
     stoch = ta.momentum.StochasticOscillator(h, l, c, 14, 3)
-    df["stoch_k"]    = stoch.stoch()
-    df["stoch_d"]    = stoch.stoch_signal()
+    df["stoch_k"]     = stoch.stoch()
+    df["stoch_d"]     = stoch.stoch_signal()
     df["stoch_cross"] = (df["stoch_k"] > df["stoch_d"]).astype(int)
 
     # ── Rate of Change ───────────────────────────────────────────────
@@ -81,8 +89,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Candle structure ─────────────────────────────────────────────
     df["candle_body"]      = (c - o) / o
-    df["candle_wick_up"]   = (h - c.clip(lower=o))  / (h - l + 1e-6)
-    df["candle_wick_down"] = (c.clip(upper=o) - l)  / (h - l + 1e-6)
+    df["candle_wick_up"]   = (h - c.clip(lower=o))   / (h - l + 1e-6)
+    df["candle_wick_down"] = (c.clip(upper=o) - l)   / (h - l + 1e-6)
     df["is_green"]    = (c > o).astype(int)
     df["prev_return"] = c.pct_change()
     df["gap_up"]      = (o - c.shift(1)) / c.shift(1)
@@ -101,12 +109,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "nifty_above_ema20" not in df.columns:
         df["nifty_above_ema20"] = 1
 
-    # ── FIX I5: New high-MI features ─────────────────────────────────
+    # ── High-MI features (added audit pass 1) ─────────────────────────
 
     # 1. Opening Range Breakout flag
-    #    ORB high = max(high) of first 3 candles per day (9:15–9:30)
-    #    session_min==0 is 9:15, ==5 is 9:20, ==10 is 9:25
-    #    Candles 0,1,2 → session_min 0,5,10
+    #    ORB = max(high) of first 3 candles per day (9:15–9:25)
+    #    session_min 0=9:15, 5=9:20, 10=9:25
     orb_mask = df["session_min"] <= 10
     orb_high = (
         df["high"]
@@ -118,7 +125,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 2. Beta-adjusted residual return (5-candle)
     #    Removes index co-movement; captures stock-specific alpha.
-    #    beta estimated as rolling 20-candle cov/var.
+    #    Beta = rolling 20-candle cov(stock, nifty) / var(nifty).
     nifty_ret = df["nifty_ret_5c"].fillna(0)
     stock_ret = df["ret_5c"].fillna(0)
     roll_cov  = stock_ret.rolling(20).cov(nifty_ret)
@@ -127,14 +134,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["beta_residual_5c"] = (stock_ret - beta_roll * nifty_ret).fillna(0)
 
     # 3. ATR expansion ratio — volatility regime
-    #    > 1.2 = expanding volatility (breakout context)
-    #    < 0.8 = compressed volatility (consolidation/low signal)
+    #    >1.2 = expanding (breakout context)
+    #    <0.8 = compressed (low signal / consolidation)
     atr_roll_mean = df["atr14"].rolling(20).mean().replace(0, 1e-9)
     df["atr_expansion"] = (df["atr14"] / atr_roll_mean).clip(0.3, 3.0).fillna(1.0)
 
-    # 4. Consecutive green candles — momentum continuation signal
-    #    Resets to 0 on any red candle. Clipped at 8 to avoid outlier leverage.
-    green = df["is_green"]
+    # 4. Consecutive green candles — momentum continuation
+    #    Resets to 0 on any red candle. Clipped at 8.
+    green    = df["is_green"]
     streak_id = (green != green.shift()).cumsum()
     df["consec_green"] = (
         green.groupby(streak_id).cumcount().where(green == 1, 0).clip(0, 8)
@@ -143,7 +150,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_labels(
+# ── ISSUE-8 FIX: Renamed to _legacy_build_labels ─────────────────
+# This close-only version is LESS ACCURATE than train.py's build_labels
+# which uses high/low to determine the order in which TP and SL are touched.
+# DO NOT import this for training. Use train.build_labels instead.
+# Kept here only for reference / backwards compatibility.
+def _legacy_build_labels(
     df,
     horizon: int = 8,
     atr_tp_mult: float = 2.0,
@@ -151,13 +163,12 @@ def build_labels(
     label_entry_shift: int = 1,
 ) -> pd.DataFrame:
     """
-    LEAKAGE-FREE label construction.
-    entry = open[t + label_entry_shift]  (default: next candle open)
-    Simulates realistic execution — signal fires at close[t],
-    order filled at open[t+1].
+    LEGACY — less accurate label builder (checks close only, not high/low).
+    Kept for reference. DO NOT use for training.
+    Use train.build_labels() which checks high/low touch order correctly.
     """
     df = df.copy()
-    atr = df["atr14"]
+    atr    = df["atr14"]
     labels = []
 
     for i in range(len(df)):
@@ -193,8 +204,9 @@ def build_labels(
     return df
 
 
-# Canonical feature column list — must match exactly between train and signal
-# FIX I5: Added orb_break, beta_residual_5c, atr_expansion, consec_green (44 total)
+# ── Canonical feature column list ────────────────────────────────
+# MUST match exactly between train.py and signal_engine.py.
+# FIX I5: 44 features (was 40). After any change here, RETRAIN is required.
 FEATURE_COLS = [
     "ema9_21_cross", "ema21_50_cross", "price_above_ema50", "price_above_ema200",
     "ema9_slope", "ema21_slope",
@@ -210,9 +222,9 @@ FEATURE_COLS = [
     "ret_3c", "ret_5c", "ret_10c",
     "hour", "session_min",
     "nifty_ret_5c", "nifty_above_ema20",
-    # FIX I5: new high-MI features
-    "orb_break",          # Opening Range Breakout — top-3 NSE intraday signal
-    "beta_residual_5c",   # Stock alpha after removing NIFTY beta noise
-    "atr_expansion",      # Volatility regime: >1.2=breakout, <0.8=consolidation
-    "consec_green",       # Consecutive green candles (0-8)
+    # high-MI features (audit pass 1)
+    "orb_break",           # Opening Range Breakout
+    "beta_residual_5c",    # Stock alpha after NIFTY beta removal
+    "atr_expansion",       # Volatility regime ratio
+    "consec_green",        # Consecutive green candles (0-8)
 ]
