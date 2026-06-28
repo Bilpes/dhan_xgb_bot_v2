@@ -1,0 +1,61 @@
+{
+  "tier_a": [
+    "ICICIBANK",
+    "HDFCBANK",
+    "AXISBANK",
+    "SBIN",
+    "BAJFINANCE",
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HCLTECH",
+    "BHARTIARTL",
+    "LT",
+    "HAL",
+    "BEL",
+    "NTPC",
+    "POWERGRID",
+    "TATAMOTORS",
+    "MARUTI",
+    "SUNPHARMA",
+    "WIPRO",
+    "TECHM"
+  ],
+  "tier_b": [
+    "BAJAJFINSV",
+    "ETERNAL",
+    "M&M",
+    "LTIM",
+    "PERSISTENT",
+    "CHOLAFIN",
+    "JSWSTEEL",
+    "DLF",
+    "IRCTC",
+    "APOLLOHOSP",
+    "CGPOWER",
+    "HAVELLS",
+    "TRENT",
+    "TITAN",
+    "ADANIPORTS",
+    "KOTAKBANK",
+    "DRREDDY",
+    "INDUSINDBK"
+  ],
+  "metadata": {
+    "version": "v3.0",
+    "created": "2026-06-28",
+    "note": "Seed watchlist — WatchlistManager will dynamically update.",
+    "size": 38,
+    "sector_composition": {
+      "BANKING": ["ICICIBANK","HDFCBANK","AXISBANK","SBIN","KOTAKBANK","INDUSINDBK"],
+      "FINANCE": ["BAJFINANCE","BAJAJFINSV","CHOLAFIN"],
+      "IT": ["TCS","INFY","HCLTECH","WIPRO","TECHM","LTIM","PERSISTENT"],
+      "AUTO": ["TATAMOTORS","MARUTI","M&M"],
+      "PHARMA": ["SUNPHARMA","DRREDDY","APOLLOHOSP"],
+      "ENERGY_INFRA": ["RELIANCE","NTPC","POWERGRID","LT","HAL","BEL","CGPOWER"],
+      "TELECOM": ["BHARTIARTL"],
+      "CONSUMER": ["ETERNAL","TRENT","TITAN","IRCTC","HAVELLS"],
+      "METALS_REALTY": ["JSWSTEEL","DLF","ADANIPORTS"]
+    }
+  }
+}
