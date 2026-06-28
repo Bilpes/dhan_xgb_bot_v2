@@ -1,77 +1,86 @@
-# dhan_xgb_bot_v3 — NSE Intraday XGBoost Algo Bot
+# dhan_xgb_bot_v2
 
-## Critical Fixes vs v2
+XGBoost-based intraday algo trading bot for NSE via Dhan broker API.
 
-| Issue | v2 | v3 Fix |
-|---|---|---|
-| Label entry price | `close[t]` — **LEAKAGE** | `open[t+1]` — correct |
-| Prob cap | Hard cap at 0.90/0.95 | Removed — raw model output |
-| Retrain embargo | None | 14-day gap enforced |
-| Prob calibration | 90% pred → 27% actual win | Aligns after retrain |
-| Watchlist | 150 stocks incl. penny/PSU | 38 quality stocks ≥₹200 |
-| ATR_SL_MULT | 1.5 (noise SL hits) | 2.2 (breathing room) |
-| VWAP gate | Hard filter ON (kills signals) | Feature only — not gated |
-| Trade mode | CNC (overnight risk) | INTRADAY / MIS |
-| Trailing SL | None | Activates at 1× ATR gain |
-| Signal scan log | None | `logs/signal_scan.csv` |
-| Sector limit | Not enforced | MAX_PER_SECTOR = 2 |
-
-## Repository Structure
+## Project Structure
 
 ```
-config.py          — all parameters (thresholds, risk, timing, Redis)
-watchlist.py       — 38-stock curated list with sector map
-features.py        — leakage-free features + label builder
-train.py           — walk-forward with 14-day embargo
-signal_engine.py   — signal generation with scan logger
-trade_manager.py   — risk sizing, trailing SL, CSV trade log
-bot.py             — main event loop (paper + live)
-auto_retrain.py    — weekly retrain scheduler
-diagnostics.py     — calibration + reject reason + P&L reports
+dhan_xgb_bot_v2/          ← GitHub repo root
+  README.md               ← this file
+  dhan_xgb_bot_v2/        ← Python package root (cd here to run)
+    bot/
+      auto_retrain.py     ← nightly walk-forward retraining
+      live_bot.py         ← main trading loop
+      signal_engine.py    ← XGBoost signal generation
+      dhan_api.py         ← Dhan broker API wrapper
+      risk_manager.py     ← position sizing & risk controls
+      trade_policy.py     ← BUY_THRESHOLD, ATR, HORIZON params
+      backtest.py         ← offline backtesting
+      telegram_alert.py   ← Telegram notifications
+      health_check.py     ← system health monitor
+      token_refresh.py    ← access token refresh
+    config/
+      config.py           ← paths, timing, filters, credentials
+      watchlist.json      ← 21-stock curated universe
+      .env.example        ← copy to .env and fill credentials
+    data/
+      features.py         ← build_features() pipeline
+      historical/         ← CSV fallback data (SYMBOL_5min.csv)
+    models/
+      xgb_model.pkl       ← deployed model (git-ignored)
+      scaler.pkl          ← deployed scaler (git-ignored)
+    logs/                 ← runtime logs (git-ignored)
+    requirements.txt
+    scheduler.bat         ← Windows Task Scheduler launcher
 ```
 
-## Quick Start
+## Setup
 
-```bash
+```cmd
+cd dhan_xgb_bot_v2\dhan_xgb_bot_v2
 pip install -r requirements.txt
-
-# 1. Set environment variables
-export DHAN_CLIENT_ID=your_id
-export DHAN_ACCESS_TOKEN=your_token
-export TELEGRAM_BOT_TOKEN=your_bot_token   # optional
-export TELEGRAM_CHAT_ID=your_chat_id       # optional
-
-# 2. Download 1yr of 5-min OHLCV data for each symbol to:
-#    data/SYMBOL_5min.csv  (columns: datetime, open, high, low, close, volume)
-
-# 3. First train
-python train.py
-
-# 4. Paper mode run
-python bot.py
-
-# 5. After 1 week — check calibration
-python diagnostics.py
+copy config\.env.example config\.env
+# Fill in DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN etc.
 ```
 
-## Leakage Verification
+## Running
 
-After first retrain, run `python diagnostics.py`.
+**All commands must be run from inside `dhan_xgb_bot_v2\dhan_xgb_bot_v2\`**
 
-**Healthy**: `prob=0.65` bucket → actual win rate ~50–65%  
-**Leakage still present**: `prob=0.90` → actual win ~25%
+```cmd
+# Retrain model
+python -m bot.auto_retrain
 
-If still leaking, verify:
-- `features.py build_labels()`: `label_entry_shift=1` (not 0)
-- `train.py`: `embargo_days=14` is set
-- `signal_engine.py`: no prob capping before logging to `signal_scan.csv`
+# Start live/paper trading bot
+python -m bot.live_bot
 
-## Expected Performance (v3 Paper Mode)
+# Run backtest
+python -m bot.backtest
 
-| Day Type | Expected Trades | Notes |
-|---|---|---|
-| BULL (Nifty trending ↑) | 5–9 | Peak signal flow |
-| SIDEWAYS | 3–6 | VWAP gate removed helps |
-| WEAK (Nifty falling ↓) | 2–5 | Threshold bumps to 0.58 |
-| Expiry Thursday | 7–12 | F&O unwinding = momentum |
-| High Vol (Budget/Results) | 6–11 | Best day for this model |
+# Health check
+python -m bot.health_check
+```
+
+## Model Performance (2026-06-28)
+
+| Metric | OOS Value |
+|--------|-----------|
+| Accuracy | 0.772 |
+| AUC | 0.868 |
+| Precision | 0.681 |
+| Recall | 0.776 |
+| Training rows | 90,320 |
+| BUY% | 39.0% |
+
+Walk-forward validated across 5 time-series folds, 21 stocks, 90-day window.
+
+## Universe
+
+21 curated NSE stocks — 12 Tier-A (always scanned) + 9 Tier-B (scanned after 10:00).
+All stocks: daily vol > 300Cr, MCap > 15,000Cr, no news-event driven names.
+See `config/watchlist.json` for the full list.
+
+## Key Parameters
+
+All trading parameters (thresholds, ATR multipliers, position limits) live in `bot/trade_policy.py`.  
+All infrastructure (paths, timing, credentials) lives in `config/config.py`.
