@@ -21,18 +21,65 @@
 #               ATR mults, HORIZON, MAX_OPEN_TRADES,
 #               DAILY_LOSS_LIMIT, MIN_RR_RATIO).
 #               config.py is now infra-only.
+#   2026-06-28: Bulletproof .env loader — searches 4 candidate
+#               paths so credentials load correctly regardless
+#               of which directory python is invoked from.
 # ============================================================
 
 
 import os
 import json as _json
+from pathlib import Path
 from dotenv import load_dotenv
 
 
-# ── Load credentials from .env file ─────────────────────────
-# .env file lives at:  config/.env
-# Never touch config.py for credentials — only .env
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# ── Bulletproof .env loader ──────────────────────────────────
+# Searches candidate paths in priority order.
+# Works whether you run:
+#   python -m bot.auto_retrain          (from project root)
+#   python auto_retrain.py              (from bot/ folder)
+#   python bot/auto_retrain.py          (from inner project folder)
+#   python .\bot\auto_retrain.py        (Windows, any cwd)
+
+def _find_and_load_env() -> bool:
+    """
+    Try loading .env from 4 candidate locations.
+    Returns True if a .env file was found and loaded.
+    Priority:
+        1. config/.env  (relative to this file — canonical location)
+        2. ../.env      (project root, one level above config/)
+        3. .env         (current working directory)
+        4. config/.env  (relative to cwd — when running from project root)
+    """
+    _this_dir   = Path(__file__).resolve().parent          # .../config/
+    _project    = _this_dir.parent                         # .../dhan_xgb_bot_v2/
+    _cwd        = Path.cwd()
+
+    candidates = [
+        _this_dir  / ".env",           # canonical: config/.env
+        _project   / ".env",           # project root fallback
+        _cwd       / "config" / ".env",# run from project root on Windows
+        _cwd       / ".env",           # last resort: cwd
+    ]
+
+    for path in candidates:
+        if path.exists():
+            load_dotenv(dotenv_path=str(path), override=True)
+            print(f"[config] ✅  Loaded .env from: {path}")
+            return True
+
+    # No .env found anywhere — warn clearly
+    print(
+        "\n[config] ⚠️  WARNING: No .env file found.\n"
+        "  Expected location: config/.env\n"
+        "  Copy config/.env.example → config/.env and fill in your credentials.\n"
+        "  Tried:\n" +
+        "\n".join(f"    • {p}" for p in candidates) + "\n"
+    )
+    return False
+
+
+_ENV_LOADED = _find_and_load_env()
 
 
 DHAN_CLIENT_ID    = os.getenv("DHAN_CLIENT_ID",    "")
