@@ -15,13 +15,21 @@
 #   cron: 0 18 * * 1-5  python -m bot.auto_retrain
 #
 # Flow:
-#   1. Fetch last RETRAIN_DAYS days of 5-min candles (broker + CSV fallback)
+#   1. Fetch last RETRAIN_DAYS days of 5-min candles
+#      — Broker first, CSV fallback (handles weekends/holidays)
 #   2. build_features() — same pipeline as train.py
-#   3. _make_atr_labels() — identical path-dependent label logic
+#   3. _make_atr_labels() — path-dependent label logic
 #   4. Walk-forward OOS evaluation (N_SPLITS folds)
-#   5. Deployment gate — same MIN_ACC / MIN_AUC / MIN_PREC as train.py
-#   6. Gate pass  -> backup old model, save new model, Telegram success alert
-#   7. Gate fail  -> keep old model, Telegram warning alert
+#   5. Deployment gate — same MIN_ACC / MIN_AUC / MIN_PREC
+#   6. Gate pass  -> backup old model, save new, Telegram alert
+#   7. Gate fail  -> keep old model, Telegram warning
+#
+# Fix log:
+#   2026-06-28: Fixed weekend/holiday silent-empty broker bug.
+#               Dhan API returns [] on weekends without raising
+#               an exception — CSV fallback was never triggered.
+#               Now: broker empty → immediately try CSV,
+#               only skip symbol if BOTH sources are empty.
 # ============================================================
 
 from __future__ import annotations
@@ -69,39 +77,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("auto_retrain")
 
-# ── Rolling retraining window ────────────────────────────────
-# IMPORTANT:
-# Markets are non-stationary.
-# Old market structure becomes statistically irrelevant over time.
-#
-# We therefore train ONLY on recent market behavior.
-#
-# Default:
-#   last 90 trading days (~3 months)
-#
-# This dramatically improves:
-#   • regime adaptation
-#   • volatility responsiveness
-#   • post-news behavior learning
-#   • recent liquidity dynamics
-#
-# Avoids:
-#   • stale COVID-era patterns
-#   • dead momentum structures
-#   • obsolete intraday volatility clusters
-#
+# ── Rolling retraining window ─────────────────────────────────
 RETRAIN_DAYS = int(os.getenv("RETRAIN_DAYS", "90"))
+N_SPLITS     = int(os.getenv("N_SPLITS",     "5"))
 
-# Walk-forward folds
-N_SPLITS = int(os.getenv("N_SPLITS", "5"))
-
-# ── Deployment gate — IDENTICAL to models/train.py ───────────
+# ── Deployment gate ───────────────────────────────────────────
 MIN_ACC  = 0.53
 MIN_AUC  = 0.55
 MIN_PREC = 0.50
-MIN_ROWS = 500    # minimum labelled rows to bother retraining
+MIN_ROWS = 500
 
-# ── XGBoost params — IDENTICAL to models/train.py ────────────
+# ── XGBoost params ─────────────────────────────────────────────
 PARAMS = dict(
     objective          = "binary:logistic",
     eval_metric        = "logloss",
@@ -122,14 +108,48 @@ PARAMS = dict(
 )
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Data loading  (broker-first, CSV fallback)
-# ─────────────────────────────────────────────────────────────
+#  FIX: Dhan returns empty list silently on weekends/holidays.
+#       Previously this was only caught if broker raised an exception.
+#       Now: empty broker response → immediately try CSV fallback.
+# ──────────────────────────────────────────────────────────────
+def _load_csv_for_symbol(
+    symbol: str,
+    hist_dir: Path,
+    cutoff: datetime,
+) -> pd.DataFrame | None:
+    """
+    Load historical CSV for a symbol.
+    Searches both data/historical/ and data/ folders.
+    Returns filtered DataFrame or None if not found.
+    """
+    candidates = [
+        hist_dir / f"{symbol}_5min.csv",               # data/historical/SYMBOL_5min.csv
+        hist_dir.parent / f"{symbol}_5min.csv",        # data/SYMBOL_5min.csv
+        hist_dir / f"{symbol}.csv",                    # data/historical/SYMBOL.csv
+        hist_dir.parent / f"{symbol}.csv",             # data/SYMBOL.csv
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                df = pd.read_csv(path, parse_dates=["datetime"])
+                df = df[df["datetime"] >= cutoff].copy()
+                df["symbol"] = symbol
+                return df
+            except Exception as e:
+                log.warning("  %s: CSV read error (%s): %s", symbol, path.name, e)
+    return None
+
+
 def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Fetch last RETRAIN_DAYS days of 5-min OHLCV for all watchlist stocks
-    plus Nifty index via DhanBroker. Falls back to historical CSV per
-    symbol if the broker call fails.
+    Fetch last RETRAIN_DAYS of 5-min OHLCV for all watchlist stocks + Nifty.
+    Strategy per symbol:
+        1. Try DhanBroker.get_candles()
+        2. If broker returns empty OR raises  → try CSV fallback
+        3. If both fail  → skip symbol with warning
+    This handles weekends, NSE holidays, and API outages transparently.
     """
     from bot.dhan_api import DhanBroker
     broker   = DhanBroker()
@@ -138,69 +158,81 @@ def _fetch_recent_candles() -> tuple[pd.DataFrame, pd.DataFrame]:
     cutoff   = datetime.now() - timedelta(days=RETRAIN_DAYS)
     frames: list[pd.DataFrame] = []
 
+    log.info("[Retrain] Starting — symbols=%d embargo=%dd folds=%d",
+             len(WATCHLIST), RETRAIN_DAYS, N_SPLITS)
+    log.info("Training on %d symbols: %s", len(WATCHLIST), list(WATCHLIST.keys()))
+
     for symbol, sec_id in WATCHLIST.items():
+        df_broker = pd.DataFrame()
+
+        # ─ Step 1: Try broker ───────────────────────────────────
         try:
-            df = broker.get_candles(sec_id, symbol, days_back=RETRAIN_DAYS)
-            if df.empty:
-                raise ValueError("empty broker response")
-            if "datetime" not in df.columns:
-                df = df.reset_index().rename(columns={"index": "datetime"})
-
-            df["symbol"] = symbol
-
-            # Strict rolling-window enforcement
-            if "datetime" in df.columns:
-                df = df[df["datetime"] >= cutoff]
-
-            frames.append(df)
-            log.info("  broker: %-14s  %d candles", symbol, len(df))
+            df_broker = broker.get_candles(sec_id, symbol, days_back=RETRAIN_DAYS)
+            if not df_broker.empty:
+                if "datetime" not in df_broker.columns:
+                    df_broker = df_broker.reset_index().rename(
+                        columns={"index": "datetime"})
+                df_broker = df_broker[
+                    df_broker["datetime"] >= cutoff].copy()
+                df_broker["symbol"] = symbol
         except Exception as e:
-            csv_path = hist_dir / f"{symbol}_5min.csv"
-            if csv_path.exists():
-                try:
-                    fb = pd.read_csv(csv_path, parse_dates=["datetime"])
-                    fb = fb[fb["datetime"] >= cutoff]
-                    fb["symbol"] = symbol
-                    frames.append(fb)
-                    log.warning("  %s: broker fail (%s) — CSV fallback (%d rows)",
-                                symbol, e, len(fb))
-                except Exception as e2:
-                    log.warning("  %s: CSV fallback also failed: %s", symbol, e2)
-            else:
-                log.warning("  %s: no data source available — skipped.", symbol)
+            log.debug("  %s: broker exception: %s", symbol, e)
+            df_broker = pd.DataFrame()
+
+        # ─ Step 2: Use broker data if non-empty ───────────────────
+        if not df_broker.empty:
+            frames.append(df_broker)
+            log.info("  broker ✅  %-14s  %d candles", symbol, len(df_broker))
+            continue
+
+        # ─ Step 3: Broker empty/failed → try CSV ─────────────────
+        df_csv = _load_csv_for_symbol(symbol, hist_dir, cutoff)
+        if df_csv is not None and not df_csv.empty:
+            frames.append(df_csv)
+            log.info("  csv    📂  %-14s  %d candles (broker empty/offline)",
+                     symbol, len(df_csv))
+            continue
+
+        # ─ Both failed ──────────────────────────────────────────
+        log.warning("  SKIP   ❌  %-14s  no broker data and no CSV found", symbol)
 
     if not frames:
         raise RuntimeError(
-            "No stock data fetched from broker or CSV. Cannot retrain."
+            "No stock data loaded from broker or CSV.\n"
+            "  It is currently a weekend/holiday and no CSV files were found.\n"
+            f"  Expected CSV location: {hist_dir / 'SYMBOL_5min.csv'}\n"
+            "  Make sure data/historical/ contains your 5-min CSV files."
         )
+
     stock_df = pd.concat(frames, ignore_index=True)
 
-    # ── Nifty index ───────────────────────────────────────────
+    # ── Nifty index ───────────────────────────────────────────────
     nifty_df = pd.DataFrame()
     try:
-        nd = broker.get_candles(NIFTY50_SECURITY_ID, "NIFTY50",
-                                days_back=RETRAIN_DAYS)
+        nd = broker.get_candles(
+            NIFTY50_SECURITY_ID, "NIFTY50", days_back=RETRAIN_DAYS)
         if not nd.empty:
             if "datetime" not in nd.columns:
                 nd = nd.reset_index().rename(columns={"index": "datetime"})
-            nifty_df = nd
-            log.info("  Nifty: %d candles (broker)", len(nifty_df))
+            nifty_df = nd[nd["datetime"] >= cutoff].copy()
+            log.info("  Nifty  ✅  broker  %d candles", len(nifty_df))
     except Exception as e:
-        if nifty_path.exists():
-            nifty_df = pd.read_csv(nifty_path, parse_dates=["datetime"])
-            nifty_df = nifty_df[nifty_df["datetime"] >= cutoff]
-            log.warning("  Nifty broker failed (%s) — CSV fallback (%d rows)",
-                        e, len(nifty_df))
-        else:
-            log.warning("  Nifty unavailable — index features will be 0.")
+        log.debug("Nifty broker exception: %s", e)
+
+    if nifty_df.empty and nifty_path.exists():
+        nifty_df = pd.read_csv(nifty_path, parse_dates=["datetime"])
+        nifty_df = nifty_df[nifty_df["datetime"] >= cutoff].copy()
+        log.info("  Nifty  📂  CSV  %d candles", len(nifty_df))
+
+    if nifty_df.empty:
+        log.warning("  Nifty unavailable — index features will be 0.")
 
     return stock_df, nifty_df
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  ATR path-dependent label
-#  IDENTICAL to _make_atr_labels() in models/train.py
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
     """
     Label = 1 (BUY) if TP hit before SL within HORIZON bars.
@@ -234,9 +266,9 @@ def _make_atr_labels(feat: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(groups, ignore_index=True)
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Walk-forward OOS evaluation
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _walk_forward(X: np.ndarray, y: np.ndarray) -> dict:
     tscv = TimeSeriesSplit(n_splits=N_SPLITS)
     accs, aucs, precs, recalls = [], [], [], []
@@ -270,9 +302,9 @@ def _walk_forward(X: np.ndarray, y: np.ndarray) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Train final model on full data
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _train_final(X: np.ndarray, y: np.ndarray) -> tuple:
     split       = int(len(X) * 0.85)
     X_tr, X_val = X[:split], X[split:]
@@ -291,9 +323,9 @@ def _train_final(X: np.ndarray, y: np.ndarray) -> tuple:
     return model, scaler
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Deployment gate
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _gate_passes(metrics: dict, n: int) -> bool:
     checks = {
         f"acc  {metrics['acc']:.3f}  >= {MIN_ACC}":  metrics["acc"]  >= MIN_ACC,
@@ -310,9 +342,9 @@ def _gate_passes(metrics: dict, n: int) -> bool:
     return all_pass
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Telegram helper
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def _notify(msg: str):
     try:
         from bot.telegram_alert import _send
@@ -321,9 +353,9 @@ def _notify(msg: str):
         log.warning("Telegram notify failed: %s", e)
 
 
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #  Main entry point
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 def retrain():
     log.info("=" * 58)
     log.info("  AUTO-RETRAIN  %s", datetime.now().strftime("%Y-%m-%d %H:%M IST"))
@@ -344,7 +376,10 @@ def retrain():
     # 2. Build features
     log.info("Building features...")
     try:
-        feat = build_features(stock_df, nifty_df=nifty_df if not nifty_df.empty else None)
+        feat = build_features(
+            stock_df,
+            nifty_df=nifty_df if not nifty_df.empty else None
+        )
     except Exception as e:
         log.error("Feature build failed: %s", e)
         _notify(f"❌ <b>Auto-retrain FAILED</b>\nFeature error: {e}")
@@ -360,11 +395,13 @@ def retrain():
     y = feat["target"].values.astype(int)
 
     pos_rate = y.mean() * 100
-    log.info("Dataset: %d rows | BUY=%.1f%%  HOLD=%.1f%%", len(X), pos_rate, 100 - pos_rate)
+    log.info("Dataset: %d rows | BUY=%.1f%%  HOLD=%.1f%%",
+             len(X), pos_rate, 100 - pos_rate)
 
     if pos_rate > 70 or pos_rate < 10:
-        log.warning("Label imbalance %.1f%% BUY — check ATR_TP_MULT/HORIZON in trade_policy.py",
-                    pos_rate)
+        log.warning(
+            "Label imbalance %.1f%% BUY — check ATR_TP_MULT/HORIZON in trade_policy.py",
+            pos_rate)
 
     if len(X) < MIN_ROWS:
         log.warning("Too few rows (%d < %d) — retrain skipped.", len(X), MIN_ROWS)
