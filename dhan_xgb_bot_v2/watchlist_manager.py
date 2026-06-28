@@ -2,6 +2,11 @@
 # =============================================================
 # OODA dynamic watchlist management.
 #
+# ISSUE-20 FIX: add get_sector(symbol) public method.
+#   trade_manager._get_sector() calls wm.get_sector(symbol) but
+#   the method didn't exist — every enter_trade() raised AttributeError
+#   → no trades were ever entered even when a valid BUY signal fired.
+#
 # Purpose
 # -------
 # The static watchlist.json defines a 38-stock starting universe.
@@ -30,8 +35,9 @@
 #   bot.py.__init__  :  wm = WatchlistManager(dhan, model, scaler, features)
 #                       tm.set_watchlist_manager(wm)
 #   bot.py.run()     :  wm.run_scheduled()     # registers wm.tick()
-#   bot.py.reload()  :  wm.reload_model()      # after auto_retrain
+#   bot.py.reload()  :  wm.reload_model(model, scaler)  # after auto_retrain
 #   trade_manager.py :  wm.record_trade_result(symbol, pnl)
+#                       wm.get_sector(symbol)            # ISSUE-20 new
 #
 # Thread safety
 # -------------
@@ -59,7 +65,7 @@ log = logging.getLogger("watchlist_manager")
 
 _WL_PATH = Path(__file__).parent / "watchlist.json"
 
-# ── Broader candidate universe scanned by WatchlistManager ──
+# -- Broader candidate universe scanned by WatchlistManager --
 # These are NSE stocks that are NOT in the base 38-stock watchlist
 # but are candidates for dynamic addition if the model scores them
 # above WM_ADD_THRESHOLD.  They are NEVER added if in BLOCKED_SYMBOLS.
@@ -89,7 +95,8 @@ CANDIDATE_UNIVERSE: List[str] = [
     # Financials / Insurance
     "ICICIPRULI", "HDFCLIFE", "SBILIFE",
     # Diversified
-    "GODREJCP", "PIDILITIND",
+    "GODREJCP",
+    # Note: PIDILITIND removed — in BLOCKED_SYMBOLS (illiquid for algo)
 ]
 
 
@@ -111,7 +118,7 @@ class WatchlistManager:
         self.scaler       = scaler
         self.feature_cols = feature_cols or FEATURE_COLS
 
-        # ── Per-symbol state ──────────────────────────────────
+        # -- Per-symbol state --
         # prob_history  : rolling window of recent XGBoost probs (for prune check)
         # consec_losses : consecutive loss counter reset on win or on prune cooldown
         # prune_cooldown: bars remaining before a pruned stock can be re-added
@@ -128,17 +135,43 @@ class WatchlistManager:
             f"max_size={cfg.WM_MAX_WATCHLIST_SIZE} scan={cfg.WM_SCAN_INTERVAL_MIN}m"
         )
 
-    # ── Model hot-reload (called by bot.reload() after retrain) ──
+    # -- ISSUE-20 FIX: get_sector() public method ----------------
+    def get_sector(self, symbol: str) -> str:
+        """
+        Return the sector for a symbol from watchlist.json SECTOR_MAP.
+        Called by trade_manager._get_sector() for MAX_PER_SECTOR enforcement.
+
+        Fallback chain:
+          1. watchlist.json SECTOR_MAP (live, reflects WM updates)
+          2. watchlist.SECTOR_MAP module-level dict (import-time snapshot)
+          3. 'UNKNOWN'
+        """
+        data = self._read_json()
+        sector_map = data.get("SECTOR_MAP", {})
+        sector = sector_map.get(symbol)
+        if sector:
+            return sector.upper()
+
+        # Fallback: module-level SECTOR_MAP (import-time snapshot)
+        try:
+            from watchlist import SECTOR_MAP
+            return SECTOR_MAP.get(symbol, "UNKNOWN").upper()
+        except Exception:
+            return "UNKNOWN"
+
+    # -- Model hot-reload (called by bot.reload() after retrain) --
     def reload_model(self, model=None, scaler=None):
         """
         Sync model/scaler with the freshly retrained version.
         Called from bot.reload() after auto_retrain completes.
-        If model/scaler not provided, re-reads pickle files directly.
+        ISSUE-21: bot.py now passes engine.model, engine.scaler explicitly
+        so we don't need to re-read from disk (saves ~40ms pickle load).
+        If model/scaler not provided, falls back to reading from disk.
         """
         if model is not None and scaler is not None:
             self.model  = model
             self.scaler = scaler
-            log.info("WatchlistManager: model/scaler reloaded from bot")
+            log.info("WatchlistManager: model/scaler reloaded from engine")
         else:
             try:
                 import pickle
@@ -148,7 +181,7 @@ class WatchlistManager:
             except Exception as e:
                 log.warning(f"WatchlistManager: reload failed — {e}")
 
-    # ── Trade result feedback (called by trade_manager._exit_position) ──
+    # -- Trade result feedback (called by trade_manager.exit_trade) --
     def record_trade_result(self, symbol: str, pnl: float):
         """
         Called on every exit (SL_HIT, TARGET_HIT, EOD, force_exit).
@@ -157,18 +190,18 @@ class WatchlistManager:
         """
         if pnl >= 0:
             self._consec_losses[symbol] = 0
-            log.debug(f"[WM] {symbol} WIN pnl=₹{pnl:.2f} → streak reset")
+            log.debug(f"[WM] {symbol} WIN pnl=Rs{pnl:.2f} -> streak reset")
         else:
             self._consec_losses[symbol] += 1
             streak = self._consec_losses[symbol]
-            log.info(f"[WM] {symbol} LOSS pnl=₹{pnl:.2f} → consec_losses={streak}")
+            log.info(f"[WM] {symbol} LOSS pnl=Rs{pnl:.2f} -> consec_losses={streak}")
             if streak >= cfg.WM_MAX_CONSEC_LOSSES:
                 log.warning(
                     f"[WM] {symbol} hit {streak} consecutive losses — "
                     "scheduling prune on next tick"
                 )
 
-    # ── Scheduled tick (registered by run_scheduled) ──────────
+    # -- Scheduled tick (registered by run_scheduled) -------------
     def tick(self):
         """
         Single OODA cycle.  Called every WM_SCAN_INTERVAL_MIN by schedule.
@@ -181,7 +214,7 @@ class WatchlistManager:
         self._last_tick = datetime.now()
         data = self._read_json()
 
-        # ── 1. PRUNE pass — check existing watchlist ──────────
+        # -- 1. PRUNE pass — check existing watchlist -------------
         tier_a = data.get("tier_a", [])
         tier_b = data.get("tier_b", [])
         blocked = set(data.get("BLOCKED_SYMBOLS", []))
@@ -198,8 +231,7 @@ class WatchlistManager:
                 modified = True
                 log.info(f"[WM] PRUNED {sym} from tier_b")
 
-        # ── 2. ADD pass — scan candidate universe ─────────────
-        # Only run full-universe ADD scan every WM_UNIVERSE_RESCAN_MIN
+        # -- 2. ADD pass — scan candidate universe ----------------
         current_size = len(tier_a) + len(tier_b)
         if current_size < cfg.WM_MAX_WATCHLIST_SIZE:
             existing = set(tier_a + tier_b + list(blocked))
@@ -226,12 +258,12 @@ class WatchlistManager:
                             f"[WM] ADDED {sym} to tier_b | score={score:.3f}"
                         )
 
-        # ── 3. Tick down prune cooldowns ──────────────────────
+        # -- 3. Tick down prune cooldowns -------------------------
         for sym in list(self._prune_cooldown):
             if self._prune_cooldown[sym] > 0:
                 self._prune_cooldown[sym] -= 1
 
-        # ── 4. Persist if changed ─────────────────────────────
+        # -- 4. Persist if changed --------------------------------
         if modified:
             data["tier_b"] = tier_b
             self._write_json(data)
@@ -241,7 +273,7 @@ class WatchlistManager:
                 f"total={len(tier_a) + len(tier_b)}"
             )
 
-    # ── Score a single symbol with the live model ──────────────
+    # -- Score a single symbol with the live model ----------------
     def _score_symbol(self, symbol: str) -> Optional[float]:
         """
         Fetch latest OHLCV, build features, return model probability.
@@ -263,15 +295,13 @@ class WatchlistManager:
             log.debug(f"[WM] score_symbol {symbol} error: {e}")
             return None
 
-    # ── Prune decision logic ───────────────────────────────────
+    # -- Prune decision logic -------------------------------------
     def _should_prune(self, symbol: str, blocked: set) -> bool:
         """
         True if any of the following prune conditions are met:
           1. In BLOCKED_SYMBOLS
           2. Consecutive losses >= WM_MAX_CONSEC_LOSSES
           3. Rolling avg prob < WM_PRUNE_THRESHOLD (sustained underperformance)
-          4. Daily volume too low (illiquid)
-          5. ATR% out of valid range (too flat or too wild)
         """
         if symbol in blocked:
             return True
@@ -291,7 +321,7 @@ class WatchlistManager:
 
         return False
 
-    # ── Liquidity / ATR gate ───────────────────────────────────
+    # -- Liquidity / ATR gate ------------------------------------
     def _passes_liquidity_gate(self, symbol: str) -> bool:
         """
         Quick liquidity and volatility sanity check.
@@ -303,18 +333,19 @@ class WatchlistManager:
         try:
             avg_price  = df["close"].mean()
             avg_volume = df["volume"].mean()
-            daily_vol_cr = (avg_price * avg_volume * 75) / 1e7  # rough Cr estimate (75 candles/day)
+            # Rough daily Cr estimate: avg_price * avg_vol_per_candle * 75 candles
+            daily_vol_cr = (avg_price * avg_volume * 75) / 1e7
 
             if daily_vol_cr < cfg.WM_MIN_DAILY_VOL_CR:
                 log.debug(
                     f"[WM] {symbol}: liquidity gate FAIL "
-                    f"daily_vol≈{daily_vol_cr:.0f}Cr < {cfg.WM_MIN_DAILY_VOL_CR}Cr"
+                    f"daily_vol~{daily_vol_cr:.0f}Cr < {cfg.WM_MIN_DAILY_VOL_CR}Cr"
                 )
                 return False
 
             # ATR% check
             from ta.volatility import average_true_range
-            atr  = average_true_range(df["high"], df["low"], df["close"], 14).iloc[-1]
+            atr     = average_true_range(df["high"], df["low"], df["close"], 14).iloc[-1]
             atr_pct = atr / avg_price
 
             if atr_pct < cfg.WM_ATR_MIN_PCT:
@@ -330,11 +361,11 @@ class WatchlistManager:
             log.debug(f"[WM] {symbol}: liquidity gate error: {e}")
             return False
 
-    # ── Data fetch ────────────────────────────────────────────
+    # -- Data fetch -----------------------------------------------
     def _fetch(self, symbol: str, n: int = 250) -> Optional[pd.DataFrame]:
         """
         Fetch OHLCV data for a symbol.
-        Priority: local CSV cache → Dhan API → None.
+        Priority: local CSV cache -> Dhan API -> None.
         """
         csv_path = f"data/{symbol}_5min.csv"
         if os.path.exists(csv_path):
@@ -350,7 +381,6 @@ class WatchlistManager:
                 pass
 
         if self.dhan is None:
-            # Paper mode without API credentials — cannot fetch
             return None
 
         try:
@@ -366,7 +396,6 @@ class WatchlistManager:
             df["datetime"] = pd.to_datetime(df["start_Time"])
             df = df.set_index("datetime").sort_index()
             df = df[["open", "high", "low", "close", "volume"]]
-            # Cache to CSV for subsequent ticks
             os.makedirs("data", exist_ok=True)
             df.to_csv(csv_path)
             return df.tail(n)
@@ -374,7 +403,7 @@ class WatchlistManager:
             log.debug(f"[WM] fetch {symbol} API error: {e}")
             return None
 
-    # ── JSON I/O ──────────────────────────────────────────────
+    # -- JSON I/O -------------------------------------------------
     @staticmethod
     def _read_json() -> dict:
         try:
@@ -408,10 +437,9 @@ class WatchlistManager:
             fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
             with os.fdopen(fd, "w") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp, _WL_PATH)  # atomic on POSIX; near-atomic on Windows
+            os.replace(tmp, _WL_PATH)
             log.debug("[WM] watchlist.json written atomically")
 
-            # Hot-refresh in-process module-level variables
             try:
                 from watchlist import _refresh_static
                 _refresh_static()
@@ -421,7 +449,7 @@ class WatchlistManager:
         except Exception as e:
             log.error(f"[WM] JSON write failed: {e}")
 
-    # ── Register with schedule (called from bot.run) ──────────
+    # -- Register with schedule (called from bot.run) -------------
     def run_scheduled(self):
         """
         Register wm.tick() with the `schedule` library at

@@ -10,6 +10,24 @@ Responsibilities
 * Paper-trade mode (logs orders without sending to Dhan)
 * Trade log (CSV append, thread-safe)
 
+Patches
+-------
+ISSUE-13: set_watchlist_manager() added — bot.py __init__ was calling it
+          and getting AttributeError before first scan.
+ISSUE-14: force_exit() added as public alias — bot.py EOD block calls
+          tm.force_exit(sym, ltp, reason); was named exit_trade() internally.
+ISSUE-15: daily_loss_breached property added — bot.py scan() guards on
+          `if self.tm.daily_loss_breached` but only _daily_cb_tripped existed.
+ISSUE-16: check_exits(symbol, candle_dict) added — bot.py passes the last
+          candle as a dict; check_sl_tp() only accepted a scalar price.
+          New method extracts low/high from the candle for realistic SL/TP.
+ISSUE-17: reset_daily() public method added — bot.run() calls it on startup.
+ISSUE-18: enter() public alias added for enter_trade() — bot.py calls
+          tm.enter(sym, sig) where sig is the dict from signal_engine.
+ISSUE-19: Position.entry_price property alias — bot.py EOD fallback accesses
+          pos.entry_price; field is named `entry`.
+ISSUE-20: _get_sector() now uses wm.get_sector() correctly after WM patch.
+
 All thresholds imported from config.py — no magic numbers here.
 """
 
@@ -53,10 +71,16 @@ class Position:
         if self.peak == 0.0:
             self.peak = self.entry
 
+    # ISSUE-19 FIX: bot.py EOD fallback reads pos.entry_price (not pos.entry)
+    @property
+    def entry_price(self) -> float:
+        """Alias for self.entry — bot.py uses this name."""
+        return self.entry
+
     @property
     def unrealised_pnl(self) -> float:
-        """Requires last_price to be set externally before calling."""
-        return (self._last_price - self.entry) * self.qty
+        """Requires set_last_price() to have been called first."""
+        return (getattr(self, '_last_price', self.entry) - self.entry) * self.qty
 
     def set_last_price(self, price: float) -> None:
         self._last_price = price
@@ -91,6 +115,18 @@ class TradeManager:
         self._ensure_header()
 
     # ------------------------------------------------------------------
+    # ISSUE-13 FIX: bot.py __init__ calls tm.set_watchlist_manager(wm)
+    # ------------------------------------------------------------------
+    def set_watchlist_manager(self, wm) -> None:
+        """
+        Wire in a WatchlistManager so that every trade exit
+        automatically calls wm.record_trade_result(symbol, pnl).
+        Called from bot.py after both tm and wm are initialised.
+        """
+        self._wm = wm
+        log.info("[TradeManager] WatchlistManager linked.")
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -117,7 +153,7 @@ class TradeManager:
 
     def compute_sl_tp(
         self, entry: float, atr: float
-    ) -> tuple[float, float, float]:
+    ) -> tuple:
         """Returns (sl, tp, rr).
 
         Uses cfg.ATR_SL_MULT and cfg.ATR_TP_MULT which MUST match the label
@@ -148,7 +184,7 @@ class TradeManager:
         """
         sl_pts = entry - sl
         if sl_pts <= 0:
-            log.warning("[TradeManager] SL >= entry for %s — skipping.", entry)
+            log.warning("[TradeManager] SL >= entry — skipping qty computation.")
             return 0
 
         risk_amount = cfg.RISK_PER_TRADE * self.capital
@@ -158,6 +194,25 @@ class TradeManager:
         max_qty = math.floor(self.capital * 0.20 / entry)
         qty = min(qty, max_qty)
         return max(qty, 1)  # minimum 1 share
+
+    # ------------------------------------------------------------------
+    # ISSUE-18 FIX: bot.py calls tm.enter(sym, sig) where sig is a dict
+    # ------------------------------------------------------------------
+    def enter(self, symbol: str, sig: dict) -> bool:
+        """
+        Convenience wrapper called by bot.py scan().
+        sig is the dict returned by SignalEngine.get_signal():
+          {'action':'BUY', 'entry':..., 'sl':..., 'target':...,
+           'prob':..., 'atr':..., 'rr_ratio':...}
+        Delegates to enter_trade() with unpacked fields.
+        """
+        return self.enter_trade(
+            symbol = symbol,
+            entry  = sig.get("entry",  0.0),
+            atr    = sig.get("atr",    0.0),
+            prob   = sig.get("prob",   0.0),
+            rr     = sig.get("rr_ratio", None),
+        )
 
     def enter_trade(
         self,
@@ -253,12 +308,30 @@ class TradeManager:
         self._realised_pnl += pnl
         self._check_daily_cb()
 
+        # ISSUE-13 FIX: notify WatchlistManager of trade result
+        if self._wm is not None:
+            try:
+                self._wm.record_trade_result(symbol, pnl)
+            except Exception as e:
+                log.debug("[TradeManager] wm.record_trade_result error: %s", e)
+
         self._log_trade(
             action=f"EXIT:{reason}", symbol=symbol, qty=pos.qty,
             price=price, sl=pos.current_sl, tp=pos.tp,
             rr=0.0, prob=0.0, pnl=pnl,
         )
         return pnl
+
+    # ------------------------------------------------------------------
+    # ISSUE-14 FIX: bot.py EOD block calls tm.force_exit(sym, ltp, reason)
+    # ------------------------------------------------------------------
+    def force_exit(self, symbol: str, price: float, reason: str = "FORCE") -> float:
+        """
+        Unconditional exit — used by bot.py EOD sweep and emergency stop.
+        Delegates to exit_trade(); the `reason` string is preserved in the log.
+        Returns realised P&L (0.0 if position not found).
+        """
+        return self.exit_trade(symbol, price, reason)
 
     def update_trailing_sl(self, symbol: str, last_price: float) -> Optional[float]:
         """Update trailing SL for a position given latest price.
@@ -275,7 +348,7 @@ class TradeManager:
 
             gain_atr = (last_price - pos.entry) / pos.atr if pos.atr > 0 else 0.0
 
-            # Activate trailing SL once gain exceeds ACTIVATE_MULT × ATR
+            # Activate trailing SL once gain exceeds ACTIVATE_MULT x ATR
             if not pos.trailing_active:
                 if gain_atr >= cfg.TRAILING_SL_ACTIVATE_MULT:
                     pos.trailing_active = True
@@ -289,7 +362,7 @@ class TradeManager:
                 new_sl = round(new_sl, 2)
                 if new_sl > pos.current_sl:
                     log.info(
-                        "[TradeManager] Trailing SL %s: %.2f → %.2f (peak=%.2f).",
+                        "[TradeManager] Trailing SL %s: %.2f -> %.2f (peak=%.2f).",
                         symbol, pos.current_sl, new_sl, pos.peak,
                     )
                     pos.current_sl = new_sl
@@ -297,22 +370,49 @@ class TradeManager:
 
         return None
 
-    def check_sl_tp(
-        self, symbol: str, last_price: float
-    ) -> Optional[str]:
-        """Check if SL or TP is triggered. Returns 'SL', 'TP', or None."""
+    # ------------------------------------------------------------------
+    # ISSUE-16 FIX: bot.py calls tm.check_exits(sym, candle_dict)
+    # check_sl_tp() only accepted a scalar price; candles have high/low
+    # ------------------------------------------------------------------
+    def check_exits(self, symbol: str, candle: dict) -> Optional[str]:
+        """
+        Check if SL or TP is triggered using the candle's high AND low.
+        This is more realistic than checking close price only:
+          - SL uses candle low  (worst-case fill within the bar)
+          - TP uses candle high (best-case fill within the bar)
+
+        Returns 'SL', 'TP', or None.  Calls exit_trade() when triggered.
+        Accepts a candle dict with keys: open, high, low, close.
+        Also accepts a scalar float (last_price) for backward compatibility.
+        """
         with self._lock:
             pos = self.positions.get(symbol)
             if pos is None:
                 return None
 
-        if last_price <= pos.current_sl:
-            self.exit_trade(symbol, last_price, reason="SL")
+        # Accept both dict (from bot.py) and scalar (legacy calls)
+        if isinstance(candle, dict):
+            low  = float(candle.get("low",   candle.get("close", 0)))
+            high = float(candle.get("high",  candle.get("close", 0)))
+        else:
+            low = high = float(candle)
+
+        # SL check (uses low — worst price seen in the bar)
+        if low <= pos.current_sl:
+            self.exit_trade(symbol, pos.current_sl, reason="SL")
             return "SL"
-        if last_price >= pos.tp:
-            self.exit_trade(symbol, last_price, reason="TP")
+
+        # TP check (uses high — target may have been hit during the bar)
+        if high >= pos.tp:
+            self.exit_trade(symbol, pos.tp, reason="TP")
             return "TP"
+
         return None
+
+    # Legacy scalar interface — kept for any direct callers
+    def check_sl_tp(self, symbol: str, last_price: float) -> Optional[str]:
+        """Backward-compatible scalar version — delegates to check_exits."""
+        return self.check_exits(symbol, last_price)
 
     def exit_all(self, prices: Dict[str, float], reason: str = "EOD") -> float:
         """Exit all open positions. Returns total P&L."""
@@ -326,7 +426,7 @@ class TradeManager:
         return total
 
     @property
-    def open_symbols(self) -> list[str]:
+    def open_symbols(self) -> list:
         with self._lock:
             return list(self.positions.keys())
 
@@ -335,21 +435,54 @@ class TradeManager:
         return self._realised_pnl
 
     # ------------------------------------------------------------------
+    # ISSUE-15 FIX: bot.py guards on `if self.tm.daily_loss_breached`
+    # ------------------------------------------------------------------
+    @property
+    def daily_loss_breached(self) -> bool:
+        """
+        True if the daily-loss circuit breaker has been tripped.
+        bot.py checks this before every scan to avoid new entries
+        after the daily P&L limit is hit.
+        """
+        self._reset_daily_if_needed()
+        return self._daily_cb_tripped
+
+    # ------------------------------------------------------------------
+    # ISSUE-17 FIX: bot.run() calls tm.reset_daily() on startup
+    # ------------------------------------------------------------------
+    def reset_daily(self) -> None:
+        """
+        Explicit daily reset — called by bot.run() at startup so that
+        any stale in-process state from a previous session is cleared.
+        Also called automatically by _reset_daily_if_needed() on date change.
+        """
+        self._today            = date.today()
+        self._realised_pnl     = 0.0
+        self._daily_cb_tripped = False
+        log.info("[TradeManager] Daily state reset for %s.", self._today)
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _get_sector(self, symbol: str) -> str:
+        # ISSUE-20 FIX: wm.get_sector() is now defined on WatchlistManager.
+        # Fallback chain: wm.get_sector() -> SECTOR_MAP import -> 'UNKNOWN'
         if self._wm is not None:
-            return self._wm.get_sector(symbol)
-        return "UNKNOWN"
+            try:
+                return self._wm.get_sector(symbol)
+            except Exception:
+                pass
+        try:
+            from watchlist import SECTOR_MAP
+            return SECTOR_MAP.get(symbol, "UNKNOWN")
+        except Exception:
+            return "UNKNOWN"
 
     def _reset_daily_if_needed(self) -> None:
         today = date.today()
         if today != self._today:
-            self._today           = today
-            self._realised_pnl    = 0.0
-            self._daily_cb_tripped = False
-            log.info("[TradeManager] Daily P&L reset for %s.", today)
+            self.reset_daily()
 
     def _check_daily_cb(self) -> None:
         """Trip the daily circuit breaker if loss exceeds threshold."""
