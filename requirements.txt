@@ -9,3 +9,4 @@ portalocker>=2.8
 requests>=2.31
 redis>=5.0
 python-dotenv>=1.0
+portalocker>=2.8.2

@@ -15,7 +15,8 @@
 #
 #  2. Atomic JSON writes — we write to a temp file and os.replace()
 #     so bot.py never reads a half-written file (POSIX atomic).
-#     portalocker adds a cross-platform advisory lock for Windows.
+#     portalocker adds a cross-platform advisory lock for Windows
+#     — optional, gracefully skipped if not installed.
 #
 #  3. Cooldown counters — each stock that was pruned sits in a
 #     PRUNE_COOLDOWN_BARS cooldown before it can re-enter. This
@@ -38,9 +39,24 @@
 #  6. Universe scan is done ONLY pre-market (9:05-9:14 AM) and
 #     every 30 min during market hours to keep API call budget
 #     low. Intra-candle scoring is done only for current watchlist.
+#
+# OODA changes 2026-06-28:
+#   - portalocker: optional — graceful fallback if not installed
+#   - schedule: optional — graceful fallback if not installed
+#   - _write_watchlist() now calls _refresh_static() so
+#     module-level SECTOR_MAP / BLOCKED_SYMBOLS in watchlist.py
+#     stay in sync after every atomic JSON write, without restart.
+#   - _write_watchlist() converted from @staticmethod to instance
+#     method to support the _refresh_static() call.
 # =============================================================
 
-import json, logging, os, pickle, tempfile, time, threading
+import json
+import logging
+import os
+import pickle
+import tempfile
+import time
+import threading
 from collections import defaultdict, deque
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -49,16 +65,20 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+
+# ── optional dependencies — graceful fallback ──────────────
 try:
     import portalocker
     _HAS_LOCK = True
 except ImportError:
+    portalocker = None          # type: ignore[assignment]
     _HAS_LOCK = False
 
 try:
     import schedule
     _HAS_SCHEDULE = True
 except ImportError:
+    schedule = None             # type: ignore[assignment]
     _HAS_SCHEDULE = False
 
 try:
@@ -75,29 +95,27 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# ── constants ──────────────────────────────────────────────────
+# ── constants ──────────────────────────────────────────────
 WATCHLIST_PATH      = Path(getattr(cfg, "WATCHLIST_JSON_PATH", "watchlist.json"))
-ADD_THRESHOLD       = float(getattr(cfg, "WM_ADD_THRESHOLD",   0.60))
-PRUNE_THRESHOLD     = float(getattr(cfg, "WM_PRUNE_THRESHOLD", 0.45))
-SCAN_INTERVAL_MIN   = int(getattr(cfg, "WM_SCAN_INTERVAL_MIN", 5))
-UNIVERSE_RESCAN_MIN = int(getattr(cfg, "WM_UNIVERSE_RESCAN_MIN", 30))
-MIN_DAILY_VOL_CR    = float(getattr(cfg, "WM_MIN_DAILY_VOL_CR", 200.0))   # Cr
-ATR_MIN_PCT         = float(getattr(cfg, "WM_ATR_MIN_PCT",      0.005))
-ATR_MAX_PCT         = float(getattr(cfg, "WM_ATR_MAX_PCT",      0.060))
-MAX_WATCHLIST_SIZE  = int(getattr(cfg, "WM_MAX_WATCHLIST_SIZE", 40))
-MAX_PER_SECTOR      = int(getattr(cfg, "MAX_PER_SECTOR",        6))        # watchlist slots/sector
-PRUNE_SCORE_WINDOW  = int(getattr(cfg, "WM_PRUNE_SCORE_WINDOW", 5))
-PRUNE_COOLDOWN_BARS = int(getattr(cfg, "WM_PRUNE_COOLDOWN_BARS", 24))     # 24×5min = 2hrs
-MAX_CONSEC_LOSSES   = int(getattr(cfg, "WM_MAX_CONSEC_LOSSES",  4))
+ADD_THRESHOLD       = float(getattr(cfg, "WM_ADD_THRESHOLD",       0.60))
+PRUNE_THRESHOLD     = float(getattr(cfg, "WM_PRUNE_THRESHOLD",     0.45))
+SCAN_INTERVAL_MIN   = int(getattr(cfg,   "WM_SCAN_INTERVAL_MIN",   5))
+UNIVERSE_RESCAN_MIN = int(getattr(cfg,   "WM_UNIVERSE_RESCAN_MIN", 30))
+MIN_DAILY_VOL_CR    = float(getattr(cfg, "WM_MIN_DAILY_VOL_CR",    200.0))
+ATR_MIN_PCT         = float(getattr(cfg, "WM_ATR_MIN_PCT",         0.005))
+ATR_MAX_PCT         = float(getattr(cfg, "WM_ATR_MAX_PCT",         0.060))
+MAX_WATCHLIST_SIZE  = int(getattr(cfg,   "WM_MAX_WATCHLIST_SIZE",  40))
+MAX_PER_SECTOR      = int(getattr(cfg,   "MAX_PER_SECTOR",         6))
+PRUNE_SCORE_WINDOW  = int(getattr(cfg,   "WM_PRUNE_SCORE_WINDOW",  5))
+PRUNE_COOLDOWN_BARS = int(getattr(cfg,   "WM_PRUNE_COOLDOWN_BARS", 24))
+MAX_CONSEC_LOSSES   = int(getattr(cfg,   "WM_MAX_CONSEC_LOSSES",   4))
 
-MARKET_OPEN  = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
+MARKET_OPEN       = dtime(9, 15)
+MARKET_CLOSE      = dtime(15, 30)
 UNIV_WINDOW_START = dtime(9, 5)
 UNIV_WINDOW_END   = dtime(15, 20)
 
-# ── broad NSE universe to scan (Nifty500 liquid subset) ───────
-# Curated to 80 names: passes min 200Cr/day volume screen.
-# The add/prune rules will dynamically narrow to 35-40 slots.
+# ── broad NSE universe (Nifty500 liquid subset, ~80 names) ─
 BROAD_UNIVERSE = [
     # BANKING / FINANCE
     "HDFCBANK","ICICIBANK","AXISBANK","SBIN","KOTAKBANK",
@@ -113,14 +131,14 @@ BROAD_UNIVERSE = [
     "SUNPHARMA","DRREDDY","CIPLA","DIVISLAB","APOLLOHOSP",
     "MAXHEALTH","FORTIS","ALKEM","LUPIN","BIOCON",
     # INFRA / CAPITAL GOODS
-    "LT","HAL","BEL","BHEL_EXCL","CGPOWER",
+    "LT","HAL","BEL","CGPOWER",
     "SIEMENS","ABB","THERMAX","CUMMINSIND","GRINDWELL",
     # ENERGY
-    "RELIANCE","NTPC","POWERGRID","TATAPOWER","ADANIGREEN",
+    "RELIANCE","NTPC","POWERGRID","TATAPOWER",
     "BPCL","IOC","HINDPETRO","GAIL","PETRONET",
     # METALS
     "JSWSTEEL","TATASTEEL","HINDALCO","VEDL","COALINDIA",
-    "NMDC","NATIONALUM","APLAPOLLO","JINDALSAW","RATNAMANI",
+    "NMDC","APLAPOLLO","JINDALSAW","RATNAMANI",
     # FMCG / CONSUMER
     "HINDUNILVR","ITC","NESTLEIND","BRITANNIA","DABUR",
     "MARICO","COLPAL","GODREJCP","EMAMILTD","TATACONSUM",
@@ -130,7 +148,7 @@ BROAD_UNIVERSE = [
     "DLF","GODREJPROP","TRENT","ETERNAL","IRCTC",
 ]
 
-# Remove permanently blocked names from universe at import time
+# Strip permanently blocked names from universe at import time
 try:
     import watchlist as _wl
     _BLOCKED = set(getattr(_wl, "BLOCKED_SYMBOLS", []))
@@ -144,57 +162,49 @@ BROAD_UNIVERSE = [s for s in BROAD_UNIVERSE if s not in _BLOCKED]
 class WatchlistManager:
     """
     Autonomous OODA pipeline that keeps watchlist.json healthy.
-
-    Thread-safe: uses a threading.Lock for in-memory state +
+    Thread-safe: threading.Lock for in-memory state +
     atomic os.replace() for file writes.
     """
 
     def __init__(self, dhan_client, model=None, scaler=None, feature_cols=None):
-        """
-        Parameters
-        ----------
-        dhan_client : dhanhq.dhanhq  — authenticated Dhan API client
-        model       : loaded XGBoost model (optional; loaded from disk if None)
-        scaler      : fitted StandardScaler  (optional)
-        feature_cols: list[str]             (optional)
-        """
-        self.dhan   = dhan_client
-        self.model  = model
-        self.scaler = scaler
+        self.dhan     = dhan_client
+        self.model    = model
+        self.scaler   = scaler
         self.features = feature_cols or FEATURE_COLS
-        self._lock  = threading.Lock()
+        self._lock    = threading.Lock()
 
-        # rolling prob scores per symbol: deque(maxlen=PRUNE_SCORE_WINDOW)
-        self._prob_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=PRUNE_SCORE_WINDOW))
-        # prune cooldown counter per symbol
-        self._cooldown: dict[str, int] = {}
-        # consecutive losses counter (incremented by trade_manager feedback)
-        self._consec_losses: dict[str, int] = defaultdict(int)
+        self._prob_history:  dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=PRUNE_SCORE_WINDOW)
+        )
+        self._cooldown:       dict[str, int]  = {}
+        self._consec_losses:  dict[str, int]  = defaultdict(int)
 
-        self._last_universe_scan = datetime.min
-        self._candidate_scores: dict[str, float] = {}  # scores from last universe scan
+        self._last_universe_scan  = datetime.min
+        self._candidate_scores:   dict[str, float] = {}
 
         if self.model is None:
             self._load_model()
 
         log.info("WatchlistManager initialised. watchlist=%s", WATCHLIST_PATH)
 
-    # ── model helpers ─────────────────────────────────────────
+    # ── model helpers ──────────────────────────────────────
     def _load_model(self):
         try:
-            with open(cfg.MODEL_PATH,  "rb") as f: self.model   = pickle.load(f)
-            with open(cfg.SCALER_PATH, "rb") as f: self.scaler  = pickle.load(f)
-            with open(cfg.FEATURE_PATH,"rb") as f: self.features= pickle.load(f)
+            with open(cfg.MODEL_PATH,   "rb") as f: self.model    = pickle.load(f)
+            with open(cfg.SCALER_PATH,  "rb") as f: self.scaler   = pickle.load(f)
+            with open(cfg.FEATURE_PATH, "rb") as f: self.features = pickle.load(f)
             log.info("Model loaded from disk.")
         except FileNotFoundError as e:
-            log.warning("Model not found (%s) — scoring disabled until model exists.", e)
+            log.warning(
+                "Model not found (%s) — scoring disabled until model exists.", e
+            )
 
     def reload_model(self):
-        """Called by auto_retrain.py after a successful retrain."""
+        """Called by bot.py reload() after a successful auto_retrain."""
         with self._lock:
             self._load_model()
 
-    # ── watchlist.json I/O ────────────────────────────────────
+    # ── watchlist.json I/O ────────────────────────────────
     @staticmethod
     def _read_watchlist() -> dict:
         """Read watchlist.json; return empty structure on any error."""
@@ -202,7 +212,6 @@ class WatchlistManager:
             if WATCHLIST_PATH.exists():
                 with open(WATCHLIST_PATH, "r") as f:
                     data = json.load(f)
-                # Normalise legacy format (plain list) to new dict format
                 if isinstance(data, list):
                     data = {"tier_a": data, "tier_b": [], "metadata": {}}
                 return data
@@ -210,18 +219,23 @@ class WatchlistManager:
             log.error("watchlist.json read error: %s — using empty list.", e)
         return {"tier_a": [], "tier_b": [], "metadata": {}}
 
-    @staticmethod
-    def _write_watchlist(data: dict):
-        """Atomically write watchlist.json via temp-file + os.replace()."""
+    def _write_watchlist(self, data: dict):
+        """
+        Atomically write watchlist.json via temp-file + os.replace().
+        After a successful write, calls watchlist._refresh_static()
+        so the live bot's module-level SECTOR_MAP / BLOCKED_SYMBOLS
+        reflect any changes without a restart.
+        """
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=WATCHLIST_PATH.parent, suffix=".json.tmp"
         )
         try:
             with os.fdopen(tmp_fd, "w") as f:
-                if _HAS_LOCK:
+                # portalocker is optional — skip advisory lock if absent
+                if _HAS_LOCK and portalocker is not None:
                     portalocker.lock(f, portalocker.LOCK_EX)
                 json.dump(data, f, indent=2)
-                if _HAS_LOCK:
+                if _HAS_LOCK and portalocker is not None:
                     portalocker.unlock(f)
             os.replace(tmp_path, WATCHLIST_PATH)
         except Exception as e:
@@ -232,9 +246,21 @@ class WatchlistManager:
                 pass
             raise
 
+        # ── OODA: hot-refresh module-level statics ─────────
+        # After the atomic write, tell watchlist.py to re-read
+        # SECTOR_MAP and BLOCKED_SYMBOLS from the new JSON so
+        # sector-limit checks in the same scan tick are correct.
+        try:
+            from watchlist import _refresh_static
+            _refresh_static()
+        except Exception as e:
+            log.debug("_refresh_static failed (non-fatal): %s", e)
+
     def _all_symbols(self) -> list[str]:
         data = self._read_watchlist()
-        return list(dict.fromkeys(data.get("tier_a", []) + data.get("tier_b", [])))
+        return list(dict.fromkeys(
+            data.get("tier_a", []) + data.get("tier_b", [])
+        ))
 
     def _sector_counts(self, symbols: list[str]) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
@@ -247,15 +273,9 @@ class WatchlistManager:
             counts[sm.get(s, "OTHER")] += 1
         return counts
 
-    # ── Dhan API data helpers ─────────────────────────────────
+    # ── Dhan API helpers ───────────────────────────────────
     def _fetch_candles(self, symbol: str, n: int = 250) -> Optional[pd.DataFrame]:
-        """
-        Fetch last `n` 5-min candles for `symbol` via Dhan intraday API.
-        Returns a DataFrame with columns [open, high, low, close, volume]
-        and a DatetimeIndex, or None on failure.
-        """
         try:
-            # dhanhq intraday_minute_data: interval in minutes
             resp = self.dhan.intraday_minute_data(
                 security_id=self._symbol_to_id(symbol),
                 exchange_segment="NSE_EQ",
@@ -267,14 +287,15 @@ class WatchlistManager:
             if not rows:
                 return None
             df = pd.DataFrame(rows)
-            # normalise column names from Dhan response
             col_map = {
                 "open": "open", "high": "high", "low": "low",
                 "close": "close", "volume": "volume",
                 "startTime": "datetime", "timestamp": "datetime",
             }
-            df.rename(columns={k: v for k, v in col_map.items() if k in df.columns},
-                      inplace=True)
+            df.rename(
+                columns={k: v for k, v in col_map.items() if k in df.columns},
+                inplace=True,
+            )
             if "datetime" in df.columns:
                 df["datetime"] = pd.to_datetime(df["datetime"])
                 df.set_index("datetime", inplace=True)
@@ -286,38 +307,40 @@ class WatchlistManager:
             return None
 
     def _symbol_to_id(self, symbol: str) -> str:
-        """
-        Resolve NSE symbol → Dhan security_id.
-        Uses dhanhq search or a cached lookup table.
-        Falls back to symbol string itself (works for index instruments).
-        """
+        # Fast path: check SECURITY_IDS in watchlist.json first
         try:
-            result = self.dhan.search_scrip(exchange_segment="NSE_EQ", searchtext=symbol)
+            data = self._read_watchlist()
+            sid = data.get("SECURITY_IDS", {}).get(symbol)
+            if sid:
+                return str(sid)
+        except Exception:
+            pass
+        # Fallback: Dhan search scrip
+        try:
+            result = self.dhan.search_scrip(
+                exchange_segment="NSE_EQ", searchtext=symbol
+            )
             if result and isinstance(result, list):
                 for item in result:
                     if item.get("tradingSymbol", "") == symbol:
                         return str(item.get("securityId", symbol))
         except Exception:
             pass
-        return symbol  # fallback — dhanhq also accepts ticker strings in some endpoints
+        return symbol
 
     def _get_daily_vol_cr(self, symbol: str) -> float:
-        """Estimate today's traded value in Cr from intraday candles."""
         try:
             df = self._fetch_candles(symbol, n=80)
             if df is None or df.empty:
                 return 0.0
-            # total traded value = sum(close × volume) / 1e7  (Cr)
             return float((df["close"] * df["volume"]).sum() / 1e7)
         except Exception:
             return 0.0
 
-    # ── XGBoost scoring ───────────────────────────────────────
-    def _score_symbol(self, symbol: str, df: Optional[pd.DataFrame] = None) -> float:
-        """
-        Return P(BUY=1) for `symbol` using latest candle features.
-        Returns 0.0 if model unavailable or data insufficient.
-        """
+    # ── XGBoost scoring ────────────────────────────────────
+    def _score_symbol(
+        self, symbol: str, df: Optional[pd.DataFrame] = None
+    ) -> float:
         if self.model is None or self.scaler is None:
             return 0.0
         try:
@@ -329,57 +352,43 @@ class WatchlistManager:
             X = feat.iloc[-1][self.features].values.reshape(1, -1)
             X = np.where(np.isfinite(X), X, 0.0)
             X_sc = self.scaler.transform(X)
-            prob = float(self.model.predict_proba(X_sc)[0, 1])
-            return prob
+            return float(self.model.predict_proba(X_sc)[0, 1])
         except Exception as e:
             log.debug("Score failed %s: %s", symbol, e)
             return 0.0
 
-    # ── core OODA tick ────────────────────────────────────────
+    # ── core OODA tick ─────────────────────────────────────
     def tick(self):
-        """
-        One OODA cycle.  Called every SCAN_INTERVAL_MIN minutes.
-        Steps:
-          1. Check market hours — skip if outside.
-          2. Score all current watchlist symbols → update prob history.
-          3. PRUNE: remove symbols that fail prune gates.
-          4. ADD: if watchlist has room, score universe candidates,
-             add those that pass add gates.
-          5. Write updated watchlist.json atomically.
-          6. Send Telegram summary if any changes occurred.
-        """
-        now = datetime.now()
+        now   = datetime.now()
         now_t = now.time()
-
         if not (MARKET_OPEN <= now_t <= MARKET_CLOSE):
-            return  # outside market hours — do nothing
-
+            return
         with self._lock:
             self._tick_inner(now)
 
     def _tick_inner(self, now: datetime):
-        data      = self._read_watchlist()
-        tier_a    = list(data.get("tier_a", []))
-        tier_b    = list(data.get("tier_b", []))
-        metadata  = dict(data.get("metadata", {}))
-        all_syms  = list(dict.fromkeys(tier_a + tier_b))
+        data     = self._read_watchlist()
+        tier_a   = list(data.get("tier_a", []))
+        tier_b   = list(data.get("tier_b", []))
+        metadata = dict(data.get("metadata", {}))
+        all_syms = list(dict.fromkeys(tier_a + tier_b))
 
-        changes_added   = []
-        changes_pruned  = []
+        changes_added:  list = []
+        changes_pruned: list = []
 
-        # ── STEP 1: score current watchlist ──────────────────
+        # ── STEP 1: score current watchlist ──────────────
         for sym in all_syms:
             prob = self._score_symbol(sym)
             self._prob_history[sym].append(prob)
             log.debug("SCORE %s → %.3f", sym, prob)
 
-        # ── STEP 2: PRUNE ────────────────────────────────────
-        to_remove = set()
+        # ── STEP 2: PRUNE ─────────────────────────────────
+        to_remove: set[str] = set()
         for sym in all_syms:
-            hist = list(self._prob_history[sym])
+            hist     = list(self._prob_history[sym])
             avg_prob = np.mean(hist) if hist else 0.0
-            atr_df = self._fetch_candles(sym, 30)
-            atr_pct = 0.01  # safe default
+            atr_df   = self._fetch_candles(sym, 30)
+            atr_pct  = 0.01
             if atr_df is not None and len(atr_df) > 14:
                 atr_val = atr_df["close"].rolling(14).std().iloc[-1]
                 atr_pct = atr_val / atr_df["close"].iloc[-1]
@@ -396,9 +405,9 @@ class WatchlistManager:
                 to_remove.add(sym)
                 self._cooldown[sym] = PRUNE_COOLDOWN_BARS
                 metadata.setdefault("prune_log", {})[sym] = {
-                    "reason": prune_reason,
+                    "reason":    prune_reason,
                     "pruned_at": now.isoformat(),
-                    "avg_prob": round(avg_prob, 4),
+                    "avg_prob":  round(avg_prob, 4),
                 }
                 changes_pruned.append((sym, prune_reason))
                 log.info("PRUNE %s — %s", sym, prune_reason)
@@ -410,14 +419,15 @@ class WatchlistManager:
         for s in set(self._cooldown) - set(expired):
             self._cooldown[s] -= 1
 
-        tier_a = [s for s in tier_a if s not in to_remove]
-        tier_b = [s for s in tier_b if s not in to_remove]
+        tier_a   = [s for s in tier_a if s not in to_remove]
+        tier_b   = [s for s in tier_b if s not in to_remove]
         all_syms = list(dict.fromkeys(tier_a + tier_b))
 
-        # ── STEP 3: ADD from universe ─────────────────────────
+        # ── STEP 3: ADD from universe ──────────────────────
         now_t = now.time()
         do_universe_scan = (
-            (now - self._last_universe_scan).total_seconds() >= UNIVERSE_RESCAN_MIN * 60
+            (now - self._last_universe_scan).total_seconds()
+            >= UNIVERSE_RESCAN_MIN * 60
             and UNIV_WINDOW_START <= now_t <= UNIV_WINDOW_END
         )
 
@@ -430,7 +440,6 @@ class WatchlistManager:
             except Exception:
                 sm = {}
 
-            # Score candidates not already in watchlist
             candidates = [
                 s for s in BROAD_UNIVERSE
                 if s not in all_syms
@@ -439,23 +448,27 @@ class WatchlistManager:
                 and s not in _BLOCKED
             ]
 
-            scored = []
+            scored: list[tuple[str, float]] = []
             for sym in candidates:
-                if len(all_syms) + len(changes_added) >= MAX_WATCHLIST_SIZE:
+                if len(all_syms) + len(scored) >= MAX_WATCHLIST_SIZE:
                     break
                 prob = self._score_symbol(sym)
                 if prob < ADD_THRESHOLD:
                     continue
                 sector = sm.get(sym, "OTHER")
                 if sector_counts.get(sector, 0) >= MAX_PER_SECTOR:
-                    log.debug("SKIP %s — sector cap (%s=%d)", sym, sector, sector_counts[sector])
+                    log.debug(
+                        "SKIP %s — sector cap (%s=%d)", sym, sector,
+                        sector_counts[sector],
+                    )
                     continue
-                # Liquidity gate
                 vol_cr = self._get_daily_vol_cr(sym)
                 if vol_cr < MIN_DAILY_VOL_CR:
-                    log.debug("SKIP %s — vol %.1f Cr < %.0f", sym, vol_cr, MIN_DAILY_VOL_CR)
+                    log.debug(
+                        "SKIP %s — vol %.1f Cr < %.0f",
+                        sym, vol_cr, MIN_DAILY_VOL_CR,
+                    )
                     continue
-                # ATR gate
                 df_tmp = self._fetch_candles(sym, 30)
                 if df_tmp is not None and len(df_tmp) > 14:
                     atr_v = df_tmp["close"].rolling(14).std().iloc[-1]
@@ -463,27 +476,30 @@ class WatchlistManager:
                     if not (ATR_MIN_PCT <= atp <= ATR_MAX_PCT):
                         log.debug("SKIP %s — atr_pct=%.4f out of range", sym, atp)
                         continue
-
                 scored.append((sym, prob))
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
-            # Sort by prob desc, add highest-scoring first
             scored.sort(key=lambda x: x[1], reverse=True)
             for sym, prob in scored:
-                if len(tier_b) + len(changes_added) < 20:  # tier_b cap
+                if len(tier_b) + len(changes_added) < 20:
                     tier_b.append(sym)
                     changes_added.append((sym, prob))
                     metadata.setdefault("add_log", {})[sym] = {
-                        "prob": round(prob, 4),
+                        "prob":     round(prob, 4),
                         "added_at": now.isoformat(),
                     }
                     log.info("ADD %s — prob=%.3f", sym, prob)
 
-        # ── STEP 4: write if anything changed ────────────────
+        # ── STEP 4: write if anything changed ─────────────
         if changes_added or changes_pruned:
             metadata["last_updated"] = now.isoformat()
-            metadata["size"] = len(tier_a) + len(tier_b)
-            new_data = {"tier_a": tier_a, "tier_b": tier_b, "metadata": metadata}
+            metadata["size"]         = len(tier_a) + len(tier_b)
+            new_data = {
+                "tier_a":   tier_a,
+                "tier_b":   tier_b,
+                "metadata": metadata,
+            }
+            # _write_watchlist calls _refresh_static() internally
             self._write_watchlist(new_data)
             log.info(
                 "watchlist.json updated — added=%d pruned=%d total=%d",
@@ -491,11 +507,11 @@ class WatchlistManager:
             )
             self._telegram_notify(changes_added, changes_pruned, metadata["size"])
 
-    # ── trade_manager feedback ────────────────────────────────
+    # ── trade_manager feedback ─────────────────────────────
     def record_trade_result(self, symbol: str, pnl: float):
         """
-        Called by trade_manager after each trade closes.
-        Tracks consecutive losses for prune gate.
+        Called by trade_manager._exit_position() after each close.
+        Feeds the consecutive-loss prune gate.
         """
         with self._lock:
             if pnl < 0:
@@ -503,7 +519,7 @@ class WatchlistManager:
             else:
                 self._consec_losses[symbol] = 0
 
-    # ── Telegram notification ─────────────────────────────────
+    # ── Telegram notification ──────────────────────────────
     def _telegram_notify(self, added: list, pruned: list, total: int):
         token = getattr(cfg, "TELEGRAM_TOKEN", None)
         chat  = getattr(cfg, "TELEGRAM_CHAT_ID", None)
@@ -529,14 +545,28 @@ class WatchlistManager:
         except Exception as e:
             log.debug("Telegram notify failed: %s", e)
 
-    # ── blocking run loop ─────────────────────────────────────
+    # ── scheduler integration ──────────────────────────────
+    def run_scheduled(self):
+        """
+        Register OODA tick with the `schedule` library.
+        bot.py calls this once; schedule.run_pending() in the
+        while loop drives execution — no second thread needed.
+        Raises ImportError with install hint if schedule absent.
+        """
+        if not _HAS_SCHEDULE or schedule is None:
+            raise ImportError(
+                "schedule not installed — run: pip install schedule"
+            )
+        schedule.every(SCAN_INTERVAL_MIN).minutes.do(self.tick)
+        log.info(
+            "Registered OODA tick with schedule every %d min.",
+            SCAN_INTERVAL_MIN,
+        )
+
     def run_forever(self):
         """
-        Standalone blocking loop.  Use this when running
-        watchlist_manager.py directly as a process.
-
-        For integration with bot.py, prefer run_scheduled()
-        which registers with the `schedule` library.
+        Standalone blocking loop for running this file directly.
+        For bot.py integration use run_scheduled() instead.
         """
         log.info("Starting OODA loop every %d min.", SCAN_INTERVAL_MIN)
         while True:
@@ -546,23 +576,11 @@ class WatchlistManager:
                 log.error("Tick error: %s", e, exc_info=True)
             time.sleep(SCAN_INTERVAL_MIN * 60)
 
-    def run_scheduled(self):
-        """
-        Register with the `schedule` library (used in bot.py).
-        Call schedule.run_pending() in the bot's main loop.
-        """
-        if not _HAS_SCHEDULE:
-            raise ImportError("pip install schedule")
-        schedule.every(SCAN_INTERVAL_MIN).minutes.do(self.tick)
-        log.info("Registered OODA tick with schedule every %d min.", SCAN_INTERVAL_MIN)
 
-
-# ══════════════════════════════════════════════════════════════
-# CLI entry-point — run standalone if needed
-# ══════════════════════════════════════════════════════════════
+# ── CLI entry-point ────────────────────────────────────────
 if __name__ == "__main__":
-    import dhanhq  # pip install dhanhq
-    client = dhanhq.dhanhq(
+    from dhanhq import dhanhq
+    client = dhanhq(
         client_id=cfg.DHAN_CLIENT_ID,
         access_token=cfg.DHAN_ACCESS_TOKEN,
     )

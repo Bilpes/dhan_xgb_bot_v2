@@ -1,144 +1,119 @@
 # watchlist.py — dhan_xgb_bot_v2 / v3
-# Single source of truth for symbol universe + sector mapping.
-# WatchlistManager reads watchlist.json dynamically; this file
-# provides the static sector map and helper functions.
+# =============================================================
+# Single source of truth for symbol universe.
+# Schema (watchlist.json):
+#   tier_a         : list[str]  — scanned from 09:20 AM
+#   tier_b         : list[str]  — scanned from 10:00 AM
+#   SECURITY_IDS   : dict       — symbol → Dhan security_id string
+#   SECTOR_MAP     : dict       — symbol → sector (UPPERCASE)
+#   BLOCKED_SYMBOLS: list[str]  — never traded, never added by WM
+#   ALT_USED       : dict       — symbol → API alt name override
+#
+# OODA change 2026-06-28:
+#   - SECTOR_MAP and BLOCKED_SYMBOLS now loaded FROM JSON
+#     so watchlist.json is the single source of truth.
+#   - get_security_id() added for Dhan API calls.
+#   - _refresh_static() lets WatchlistManager hot-refresh
+#     module-level vars after atomic JSON write.
+# =============================================================
 
 import json
 from pathlib import Path
+from typing import Optional
 
 _WL_PATH = Path(__file__).parent / "watchlist.json"
 
-# ── dynamic loader ─────────────────────────────────────────
+
+# ── JSON loader ────────────────────────────────────────────
 def _load_json() -> dict:
+    """
+    Re-reads watchlist.json on every call.
+    WatchlistManager atomic-writes this file; callers always
+    get the latest version on each scan tick without restarting.
+    """
     try:
         with open(_WL_PATH) as f:
             data = json.load(f)
+        # Legacy support: old schema was a flat list
         if isinstance(data, list):
-            return {"tier_a": data, "tier_b": [], "metadata": {}}
+            return {
+                "tier_a": data, "tier_b": [],
+                "SECURITY_IDS": {}, "SECTOR_MAP": {},
+                "BLOCKED_SYMBOLS": [], "ALT_USED": {},
+            }
         return data
     except Exception:
-        return {"tier_a": [], "tier_b": [], "metadata": {}}
+        return {
+            "tier_a": [], "tier_b": [],
+            "SECURITY_IDS": {}, "SECTOR_MAP": {},
+            "BLOCKED_SYMBOLS": [], "ALT_USED": {},
+        }
 
+
+# ── universe helpers ───────────────────────────────────────
 def get_watchlist() -> list[str]:
-    """Return combined tier_a + tier_b, deduped, respecting current JSON."""
+    """
+    Combined tier_a + tier_b, deduped, in scan priority order.
+    Called on every scan tick — always reflects the live JSON.
+    """
     data = _load_json()
     combined = data.get("tier_a", []) + data.get("tier_b", [])
-    return list(dict.fromkeys(combined))
+    return list(dict.fromkeys(combined))  # preserve order, dedup
+
 
 def get_tier_a() -> list[str]:
+    """Tier A stocks — scanned from 09:20 AM."""
     return list(_load_json().get("tier_a", []))
 
+
 def get_tier_b() -> list[str]:
+    """Tier B stocks — scanned from 10:00 AM."""
     return list(_load_json().get("tier_b", []))
 
+
+def get_security_id(symbol: str) -> Optional[str]:
+    """
+    Return Dhan security_id string for a symbol, or None.
+    Used by signal_engine and trade_manager instead of
+    any hardcoded ID dict elsewhere in the codebase.
+    """
+    return _load_json().get("SECURITY_IDS", {}).get(symbol)
+
+
 def is_tradeable(symbol: str) -> bool:
-    return symbol in get_watchlist() and symbol not in BLOCKED_SYMBOLS
+    """True if symbol is in active watchlist and not blocked."""
+    blocked = set(_load_json().get("BLOCKED_SYMBOLS", []))
+    return symbol in get_watchlist() and symbol not in blocked
 
-# ── sector map ─────────────────────────────────────────────
-# Static sector classification used by signal_engine.py for
-# per-sector position limits.  WatchlistManager also uses this
-# to prevent sector concentration when adding new stocks.
-SECTOR_MAP: dict[str, str] = {
-    # BANKING
-    "HDFCBANK":    "BANKING",
-    "ICICIBANK":   "BANKING",
-    "AXISBANK":    "BANKING",
-    "SBIN":        "BANKING",
-    "KOTAKBANK":   "BANKING",
-    "INDUSINDBK":  "BANKING",
-    "FEDERALBNK":  "BANKING",
-    "AUBANK":      "BANKING",
-    # FINANCE
-    "BAJFINANCE":  "FINANCE",
-    "BAJAJFINSV":  "FINANCE",
-    "CHOLAFIN":    "FINANCE",
-    "HDFCLIFE":    "FINANCE",
-    "SBILIFE":     "FINANCE",
-    "MUTHOOTFIN":  "FINANCE",
-    "MANAPPURAM":  "FINANCE",
-    # IT
-    "TCS":         "IT",
-    "INFY":        "IT",
-    "HCLTECH":     "IT",
-    "WIPRO":       "IT",
-    "TECHM":       "IT",
-    "LTIM":        "IT",
-    "PERSISTENT":  "IT",
-    "COFORGE":     "IT",
-    "MPHASIS":     "IT",
-    "KPITTECH":    "IT",
-    # AUTO
-    "TATAMOTORS":  "AUTO",
-    "MARUTI":      "AUTO",
-    "M&M":         "AUTO",
-    "BAJAJ-AUTO":  "AUTO",
-    "EICHERMOT":   "AUTO",
-    "MOTHERSON":   "AUTO",
-    "BALKRISIND":  "AUTO",
-    "TIINDIA":     "AUTO",
-    # PHARMA
-    "SUNPHARMA":   "PHARMA",
-    "DRREDDY":     "PHARMA",
-    "CIPLA":       "PHARMA",
-    "DIVISLAB":    "PHARMA",
-    "APOLLOHOSP":  "PHARMA",
-    "MAXHEALTH":   "PHARMA",
-    "LUPIN":       "PHARMA",
-    # ENERGY / INFRA
-    "RELIANCE":    "ENERGY",
-    "NTPC":        "ENERGY",
-    "POWERGRID":   "ENERGY",
-    "TATAPOWER":   "ENERGY",
-    "BPCL":        "ENERGY",
-    "IOC":         "ENERGY",
-    "GAIL":        "ENERGY",
-    "LT":          "INFRA",
-    "HAL":         "INFRA",
-    "BEL":         "INFRA",
-    "CGPOWER":     "INFRA",
-    "SIEMENS":     "INFRA",
-    "ABB":         "INFRA",
-    # TELECOM
-    "BHARTIARTL":  "TELECOM",
-    # CONSUMER
-    "ETERNAL":     "CONSUMER",
-    "TRENT":       "CONSUMER",
-    "TITAN":       "CONSUMER",
-    "IRCTC":       "CONSUMER",
-    "HAVELLS":     "CONSUMER",
-    "HINDUNILVR":  "CONSUMER",
-    "ITC":         "CONSUMER",
-    "NESTLEIND":   "CONSUMER",
-    # METALS / REALTY
-    "JSWSTEEL":    "METALS",
-    "TATASTEEL":   "METALS",
-    "HINDALCO":    "METALS",
-    "VEDL":        "METALS",
-    "COALINDIA":   "METALS",
-    "DLF":         "REALTY",
-    "GODREJPROP":  "REALTY",
-    "ADANIPORTS":  "PORTS",
-}
 
-# ── permanent blocklist ────────────────────────────────────
-# These symbols are NEVER added by WatchlistManager regardless
-# of their XGBoost score.  Reasons: regulatory risk, Adani
-# group news-event driven moves, extreme illiquidity, or
-# historically consistent false-positive signals.
-BLOCKED_SYMBOLS: list[str] = [
-    # Adani group — news event driven, not technical
-    "ADANIENT", "ADANITRANS", "ADANIPOWER", "ADANIGREEN",
-    "ADANIWILMAR", "ADANIENSOL",
-    # Extreme illiquidity / low float
-    "YESBANK", "IDEA", "RBLBANK", "PAYTM",
-    # Duplicate / removed from universe
-    "HINDCOPPER",    # previously in TIER_B AND blocked — resolved
-    "PIDILITIND",    # <250Cr daily vol
-    "BANKBARODA",
-    "IPCALAB",
-    "KALYANKJIL",
-    "DELHIVERY",
-    "IRFC",          # government bond proxy — low alpha
-    "RVNL",          # erratic order flow
-    "BHEL_EXCL",     # placeholder entry removed
-]
+# ── module-level static copies (fast in-process lookups) ──
+# Source of truth is watchlist.json.  Call _refresh_static()
+# after any JSON write to sync these without restarting.
+def _build_sector_map() -> dict[str, str]:
+    return {k: v.upper() for k, v in _load_json().get("SECTOR_MAP", {}).items()}
+
+
+def _build_blocked() -> list[str]:
+    return _load_json().get("BLOCKED_SYMBOLS", [])
+
+
+SECTOR_MAP: dict[str, str] = _build_sector_map()
+BLOCKED_SYMBOLS: list[str] = _build_blocked()
+
+
+def _refresh_static() -> None:
+    """
+    Hot-refresh SECTOR_MAP + BLOCKED_SYMBOLS after
+    WatchlistManager._write_watchlist() atomically updates JSON.
+    Call this at the end of every WM write so the live bot
+    sees sector changes without a restart.
+
+    Usage in watchlist_manager.py:
+        from watchlist import _refresh_static
+        ...
+        self._write_watchlist(new_data)
+        _refresh_static()
+    """
+    global SECTOR_MAP, BLOCKED_SYMBOLS
+    SECTOR_MAP      = _build_sector_map()
+    BLOCKED_SYMBOLS = _build_blocked()
