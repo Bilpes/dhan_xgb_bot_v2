@@ -36,10 +36,10 @@ ATR_PERIOD  = 14
 # Entry filters
 # ─────────────────────────────────────────────────────────────
 
-BUY_THRESHOLD_DEFAULT = 0.60
-
+BUY_THRESHOLD_DEFAULT = 0.55
+BUY_THRESHOLD_WEAK    = 0.60   # Weak Nifty days — slightly tighter
 # Minimum reward:risk required
-MIN_RR_RATIO = 1.4
+MIN_RR_RATIO = 1.2
 
 
 # ─────────────────────────────────────────────────────────────
@@ -47,11 +47,11 @@ MIN_RR_RATIO = 1.4
 # ─────────────────────────────────────────────────────────────
 
 # Hard probability exits
-EXIT_LONG_THRESHOLD  = 0.56
+EXIT_LONG_THRESHOLD  = 0.48
 EXIT_SHORT_THRESHOLD = 0.60
 
 # Weakening regime
-WEAK_THRESHOLD    = 0.60            
+WEAK_THRESHOLD    = 0.52        
 WEAK_CANDLES_MAX  = 5
 
 # Momentum failure exit
@@ -72,7 +72,7 @@ MAX_OPEN_POSITIONS = 5
 MAX_DAILY_LOSS_PCT = 0.03     # stop trading after -3%
 
 # Consecutive SL protection
-MAX_CONSECUTIVE_LOSSES = 4
+MAX_CONSECUTIVE_LOSSES = 5
 
 # ─────────────────────────────────────────────────────────────
 # Volatility-adjusted position sizing

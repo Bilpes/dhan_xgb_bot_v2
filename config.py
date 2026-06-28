@@ -28,8 +28,8 @@ NO_NEW_TRADE_AFTER   = dtime(15, 0)
 INTRADAY_EXIT_TIME   = dtime(15, 15)
 
 # ── Signal thresholds ────────────────────────────────────────
-BUY_THRESHOLD_DEFAULT = 0.55
-BUY_THRESHOLD_WEAK    = 0.58
+BUY_THRESHOLD_DEFAULT = 0.65
+BUY_THRESHOLD_WEAK    = 0.72
 SELL_THRESHOLD        = 0.45
 PROB_CAP              = None   # REMOVED — raw model output always
 

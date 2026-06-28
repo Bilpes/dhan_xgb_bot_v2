@@ -108,7 +108,7 @@ TREND_STRENGTH_ENABLED = True
 # Buy only if:
 #   EMA20 > EMA50
 #   AND close > VWAP
-REQUIRE_VWAP_CONFIRM   = True
+REQUIRE_VWAP_CONFIRM   = False
 
 
 # ── Re-entry protection ─────────────────────────────────────
