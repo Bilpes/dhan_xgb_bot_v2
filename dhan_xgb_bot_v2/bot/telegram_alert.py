@@ -1,5 +1,7 @@
 # ============================================================
-#  bot/telegram_alert.py  —  Send trade alerts to 2 Telegram numbers
+#  bot/telegram_alert.py  —  Send trade alerts to Telegram
+#                            with TRUE net P&L after all Dhan
+#                            intraday charges (brokerage.py)
 # ============================================================
 """
 SETUP (one time):
@@ -23,6 +25,7 @@ from config.config import (
     TELEGRAM_CHAT_ID_1,
     TELEGRAM_CHAT_ID_2,
 )
+from bot.brokerage import calculate_charges, ChargeBreakdown
 
 log = logging.getLogger("telegram")
 
@@ -42,7 +45,7 @@ def _send(message: str):
             resp = requests.post(url, json={
                 "chat_id":    chat_id,
                 "text":       message,
-                "parse_mode": "HTML",        # enables <b>, <i>, <code> tags
+                "parse_mode": "HTML",
             }, timeout=10)
 
             if resp.status_code != 200:
@@ -56,9 +59,6 @@ def _send(message: str):
 
 # ── Alert types ──────────────────────────────────────────────
 
-from datetime import datetime
-
-
 def alert_entry(
     symbol: str,
     buy_price: float,
@@ -70,26 +70,21 @@ def alert_entry(
     invested: float,
 ):
     """
-    Telegram BUY alert.
+    Telegram BUY alert — includes breakeven price so trader
+    knows the minimum move needed to cover charges.
     """
+    from bot.brokerage import calculate_charges
 
     time_str = datetime.now().strftime("%I:%M %p")
 
-    rr = (
-        (target - buy_price)
-        / max(buy_price - stop_loss, 0.01)
-    )
+    rr = (target - buy_price) / max(buy_price - stop_loss, 0.01)
+    risk_pct = (abs(buy_price - stop_loss) / buy_price) * 100
+    mode_str = "INTRADAY" if trade_mode.lower() == "intraday" else "SWING"
 
-    risk_pct = (
-        abs(buy_price - stop_loss)
-        / buy_price
-    ) * 100
-
-    mode_str = (
-        "INTRADAY"
-        if trade_mode.lower() == "intraday"
-        else "SWING"
-    )
+    # Estimate charges at entry time using target as hypothetical sell
+    # so the breakeven sell is always shown accurately.
+    charges_est = calculate_charges(buy_price, buy_price, quantity)
+    be_sell = charges_est.breakeven_sell
 
     msg = (
         f"🟢 <b>BUY ORDER PLACED</b>\n"
@@ -98,6 +93,7 @@ def alert_entry(
         f"📈 <b>Buy Price</b>    : ₹{buy_price:,.2f}\n"
         f"🎯 <b>Target</b>       : ₹{target:,.2f}\n"
         f"🛑 <b>Stop Loss</b>    : ₹{stop_loss:,.2f}\n"
+        f"⚖️ <b>Breakeven</b>    : ₹{be_sell:,.2f}  <i>(after charges)</i>\n"
         f"📦 <b>Quantity</b>     : {quantity:,} shares\n"
         f"💰 <b>Invested</b>     : ₹{invested:,.0f}\n"
         f"⚖️ <b>Risk/Reward</b>  : {rr:.2f}\n"
@@ -107,70 +103,97 @@ def alert_entry(
         f"🕐 <b>Mode</b>         : {mode_str}\n"
         f"⏰ <b>Time</b>         : {time_str}"
     )
-
     _send(msg)
 
-def alert_exit(symbol: str, buy_price: float, sell_price: float,
-               quantity: int, pnl: float, reason: str, trade_mode: str):
-    """
-    Sent when bot exits a position.
 
-    Example:
-    ────────────────────────
-    🔴 POSITION CLOSED
-    ────────────────────────
-    🏢 Company   : HDFCBANK
-    📈 Buy price : ₹1,723.50
-    📉 Sell price: ₹1,805.20
-    📦 Quantity  : 52 shares
-    💵 P&L       : +₹4,246  ✅ PROFIT
-    📋 Reason    : Signal flip (model bearish)
-    ⏰ Time      : 11:47 AM
+def alert_exit(
+    symbol: str,
+    buy_price: float,
+    sell_price: float,
+    quantity: int,
+    pnl: float,            # gross pnl passed in from live_bot (kept for compat)
+    reason: str,
+    trade_mode: str,
+):
+    """
+    Exit alert with FULL Dhan charge breakdown and true net P&L.
+    The 'pnl' parameter is the gross P&L from live_bot — we recalculate
+    true net here using brokerage.py so the breakdown is always shown.
     """
     time_str  = datetime.now().strftime("%I:%M %p")
-    pnl_sign  = "+" if pnl >= 0 else ""
-    pnl_emoji = "✅ PROFIT" if pnl >= 0 else "❌ LOSS"
-    top_emoji = "🔴" if pnl < 0 else "💚"
+
+    # ── True P&L with all charges ─────────────────────────────
+    charges = calculate_charges(buy_price, sell_price, quantity)
+    gross   = charges.gross_pnl
+    net     = charges.net_pnl
+
+    net_sign  = "+" if net >= 0 else ""
+    top_emoji = "💚" if net >= 0 else "🔴"
+    result    = "✅ PROFIT" if net >= 0 else "❌ LOSS"
 
     reason_map = {
         "SL_HIT":          "Stop-loss hit",
         "SIGNAL_FLIP":     "Signal flip (model turned bearish)",
         "INTRADAY_CUTOFF": "3:10 PM square-off",
         "TRAIL_STOP":      "Trailing stop triggered",
+        "TARGET_HIT":      "Target hit",
         "MANUAL":          "Manual exit",
     }
     reason_str = reason_map.get(reason, reason)
 
+    # Log the full breakdown to bot logs
+    log.info(
+        "[EXIT] %s  buy=₹%.2f sell=₹%.2f qty=%d  %s",
+        symbol, buy_price, sell_price, quantity,
+        charges.to_log_string(),
+    )
+
     msg = (
         f"{top_emoji} <b>POSITION CLOSED</b>\n"
-        f"{'─' * 28}\n"
-        f"🏢 <b>Company</b>    : <b>{symbol}</b>\n"
-        f"📈 <b>Buy price</b>  : ₹{buy_price:,.2f}\n"
-        f"📉 <b>Sell price</b> : ₹{sell_price:,.2f}\n"
-        f"📦 <b>Quantity</b>   : {quantity} shares\n"
-        f"💵 <b>P&L</b>        : {pnl_sign}₹{abs(pnl):,.0f}  {pnl_emoji}\n"
-        f"📋 <b>Reason</b>     : {reason_str}\n"
-        f"⏰ <b>Time</b>       : {time_str}"
+        f"{'─' * 30}\n"
+        f"🏢 <b>Company</b>      : <b>{symbol}</b>\n"
+        f"📈 <b>Buy price</b>    : ₹{buy_price:,.2f}\n"
+        f"📉 <b>Sell price</b>   : ₹{sell_price:,.2f}\n"
+        f"📦 <b>Quantity</b>     : {quantity} shares\n"
+        f"📋 <b>Reason</b>       : {reason_str}\n"
+        f"⏰ <b>Time</b>         : {time_str}"
+        f"{charges.to_telegram_lines()}\n"
+        f"{'─' * 30}\n"
+        f"<b>Result: {result}</b>"
     )
     _send(msg)
 
 
-def alert_trail_update(symbol: str, new_sl: float, ltp: float, unrealised_pnl: float):
-    """Sent when trailing stop moves up (locking in profit)."""
+def alert_trail_update(
+    symbol: str,
+    new_sl: float,
+    ltp: float,
+    unrealised_gross: float,
+    buy_price: float,
+    quantity: int,
+):
+    """
+    Trailing stop update — shows unrealised net P&L (if stopped out here).
+    """
+    # Estimate net if stopped out at current LTP
+    charges_if_exit = calculate_charges(buy_price, ltp, quantity)
+    unrealised_net  = charges_if_exit.net_pnl
+
     msg = (
         f"🔒 <b>TRAILING STOP UPDATED</b>\n"
         f"{'─' * 28}\n"
-        f"🏢 <b>Company</b>     : <b>{symbol}</b>\n"
-        f"📍 <b>Current price</b>: ₹{ltp:,.2f}\n"
-        f"🛑 <b>New stop-loss</b>: ₹{new_sl:,.2f}\n"
-        f"💵 <b>Unrealised P&L</b>: +₹{unrealised_pnl:,.0f} (locked in)\n"
-        f"⏰ <b>Time</b>         : {datetime.now().strftime('%I:%M %p')}"
+        f"🏢 <b>Company</b>          : <b>{symbol}</b>\n"
+        f"📍 <b>Current price</b>    : ₹{ltp:,.2f}\n"
+        f"🛑 <b>New stop-loss</b>    : ₹{new_sl:,.2f}\n"
+        f"💵 <b>Unrealised gross</b> : +₹{unrealised_gross:,.2f}\n"
+        f"💵 <b>Unrealised net</b>   : +₹{unrealised_net:,.2f}  <i>(after charges)</i>\n"
+        f"⏰ <b>Time</b>             : {datetime.now().strftime('%I:%M %p')}"
     )
     _send(msg)
 
 
 def alert_daily_summary(
-    pnl: float,
+    pnl: float,            # gross pnl sum — kept for compat, we recalculate below
     trades: list,
     capital: float,
     total_trades: int = 0,
@@ -178,45 +201,77 @@ def alert_daily_summary(
     losses: int = 0,
 ):
     """
-    Sent at end of day (3:30 PM).
-    Shows all trades with buy/sell prices.
-    """
+    End-of-day summary with TRUE net P&L per trade and overall.
 
+    Each dict in `trades` must have:
+      symbol, entry (buy price), exit (sell price), qty, pnl (gross)
+    We recalculate charges per trade here so figures are always accurate.
+    """
     time_str = datetime.now().strftime("%d %b %Y")
 
-    # fallback safety
-    if not wins and not losses:
-        wins = len([t for t in trades if t["pnl"] > 0])
-        losses = len([t for t in trades if t["pnl"] <= 0])
-
-    pnl_sign = "+" if pnl >= 0 else ""
-    summary_emoji = "🏆" if pnl >= 0 else "📉"
-
-    trade_lines = ""
+    # ── Recalculate net P&L per trade from actual fills ──────
+    enriched_trades = []
+    total_gross     = 0.0
+    total_charges   = 0.0
+    total_net       = 0.0
 
     for t in trades:
-        p_sign = "+" if t["pnl"] >= 0 else ""
-        emoji  = "✅" if t["pnl"] >= 0 else "❌"
+        c = calculate_charges(
+            buy_price  = t["entry"],
+            sell_price = t["exit"],
+            quantity   = t["qty"],
+        )
+        enriched_trades.append({**t, "_charges": c})
+        total_gross   += c.gross_pnl
+        total_charges += c.total_charges
+        total_net     += c.net_pnl
 
+    # Recount wins/losses based on NET (not gross)
+    if not wins and not losses:
+        wins   = sum(1 for t in enriched_trades if t["_charges"].net_pnl > 0)
+        losses = sum(1 for t in enriched_trades if t["_charges"].net_pnl <= 0)
+
+    net_sign      = "+" if total_net >= 0 else ""
+    summary_emoji = "🏆" if total_net >= 0 else "📉"
+
+    # ── Per-trade lines ───────────────────────────────────────
+    trade_lines = ""
+    for t in enriched_trades:
+        c = t["_charges"]
+        p_sign = "+" if c.net_pnl >= 0 else ""
+        emoji  = "✅" if c.net_pnl >= 0 else "❌"
         trade_lines += (
             f"\n{emoji} <b>{t['symbol']}</b>  "
-            f"Buy ₹{t['entry']:,.1f} → Sell ₹{t['exit']:,.1f}  "
-            f"Qty {t['qty']}  <b>{p_sign}₹{t['pnl']:,.0f}</b>"
+            f"₹{t['entry']:,.1f}→₹{t['exit']:,.1f}  "
+            f"×{t['qty']}  "
+            f"gross {'+' if c.gross_pnl>=0 else ''}₹{c.gross_pnl:.0f}  "
+            f"chg -₹{c.total_charges:.2f}  "
+            f"<b>net {p_sign}₹{c.net_pnl:.2f}</b>"
         )
 
     msg = (
         f"{summary_emoji} <b>DAILY SUMMARY — {time_str}</b>\n"
-        f"{'─' * 28}\n"
-        f"📊 Total trades  : {total_trades}\n"
-        f"✅ Wins          : {wins}\n"
-        f"❌ Losses        : {losses}\n"
-        f"💰 Net P&L       : {pnl_sign}₹{abs(pnl):,.0f}\n"
-        f"🏦 Capital now   : ₹{capital:,.0f}\n"
-        f"{'─' * 28}"
+        f"{'─' * 32}\n"
+        f"📊 Total trades   : {total_trades or len(trades)}\n"
+        f"✅ Wins (net)     : {wins}\n"
+        f"❌ Losses (net)   : {losses}\n"
+        f"{'─' * 32}\n"
+        f"💹 Gross P&L      : {'+' if total_gross>=0 else ''}₹{total_gross:,.2f}\n"
+        f"🏦 Total charges  : -₹{total_charges:,.2f}\n"
+        f"💰 <b>Net P&L</b>       : <b>{net_sign}₹{total_net:,.2f}</b>\n"
+        f"🏦 Capital now    : ₹{capital:,.0f}\n"
+        f"{'─' * 32}"
         f"{trade_lines if trade_lines else chr(10) + 'No trades today.'}"
     )
-
     _send(msg)
+
+    # Also log the daily P&L statement
+    log.info(
+        "[DAILY] trades=%d wins=%d losses=%d "
+        "gross=₹%.2f charges=₹%.2f net=₹%.2f capital=₹%.0f",
+        total_trades or len(trades), wins, losses,
+        total_gross, total_charges, total_net, capital,
+    )
 
 
 def alert_circuit_breaker(daily_loss: float, capital: float):
@@ -225,15 +280,15 @@ def alert_circuit_breaker(daily_loss: float, capital: float):
         f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n"
         f"{'─' * 28}\n"
         f"⛔ Bot has <b>stopped trading</b> for today.\n"
-        f"📉 Daily loss    : -₹{abs(daily_loss):,.0f}\n"
-        f"🏦 Capital left  : ₹{capital:,.0f}\n"
-        f"⏰ Time          : {datetime.now().strftime('%I:%M %p')}\n\n"
+        f"📉 Daily net loss : -₹{abs(daily_loss):,.2f}\n"
+        f"🏦 Capital left   : ₹{capital:,.0f}\n"
+        f"⏰ Time           : {datetime.now().strftime('%I:%M %p')}\n\n"
         f"Bot will resume automatically tomorrow at 9:15 AM."
     )
     _send(msg)
 
 
-def alert_bot_started(mode: str, capital: float, trade_mode: str, max_trades: int = 4):
+def alert_bot_started(mode: str, capital: float, trade_mode: str, max_trades: int = 5):
     _send(
         f"🤖 <b>BOT STARTED</b>\n"
         f"Mode: <b>{mode.upper()}</b>\n"
@@ -243,18 +298,18 @@ def alert_bot_started(mode: str, capital: float, trade_mode: str, max_trades: in
         f"Time: {datetime.now().strftime('%d %b %Y %H:%M:%S')}"
     )
 
+
 def alert_test():
     """Send a test message to verify setup. Run this first."""
+    from bot.brokerage import calculate_charges
+    c = calculate_charges(buy_price=1000, sell_price=1005, quantity=10)
     msg = (
         f"✅ <b>Telegram alert working!</b>\n"
         f"{'─' * 28}\n"
         f"Your Dhan XGBoost trading bot is connected.\n"
-        f"You will receive alerts for:\n"
-        f"  📈 Every BUY order (company, price, qty)\n"
-        f"  📉 Every SELL order (profit/loss)\n"
-        f"  🔒 Trailing stop updates\n"
-        f"  📊 Daily summary at 3:30 PM\n"
-        f"  🚨 Circuit breaker if triggered\n\n"
+        f"Charges are calculated with EXACT Dhan MIS formula.\n\n"
+        f"<b>Example: HDFCBANK  ₹1000→₹1005  ×10 shares</b>"
+        f"{c.to_telegram_lines()}\n\n"
         f"⏰ Test sent at {datetime.now().strftime('%I:%M %p, %d %b %Y')}"
     )
     _send(msg)
