@@ -4,7 +4,8 @@
 #
 #  THIS FILE OWNS: credentials, paths, candle settings,
 #                  timing windows, entry quality filters,
-#                  Redis TTLs, Telegram IDs.
+#                  capital sizing constants, Redis TTLs,
+#                  Telegram IDs.
 #
 #  THIS FILE DOES NOT OWN: BUY_THRESHOLD, ATR_SL_MULT,
 #  ATR_TP_MULT, HORIZON, MAX_OPEN_POSITIONS, MAX_DAILY_LOSS,
@@ -24,6 +25,9 @@
 #               Now builds {symbol: security_id} correctly.
 #   2026-06-29: Added DAILY_LOSS_LIMIT — was missing, caused
 #               ImportError in risk_manager.py on live_bot start.
+#   2026-06-29: Added MAX_OPEN_TRADES — was missing, caused
+#               ImportError in live_bot.py. Full import audit done;
+#               no further missing constants.
 # ============================================================
 
 import os
@@ -80,13 +84,14 @@ TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 
 
 # ── Capital & position sizing ────────────────────────────────
-CAPITAL               = 400_000
-MAX_RISK_PCT          = 0.01        # 1% of capital max risk per trade
-MAX_CAPITAL_PER_TRADE = 0.25        # 25% of capital max per single position
-MAX_PER_SECTOR        = 2
+CAPITAL               = 400_000     # Total trading capital in INR
+MAX_RISK_PCT          = 0.01        # 1% of capital max risk per trade = ₹4,000
+MAX_CAPITAL_PER_TRADE = 0.25        # 25% of capital max per single position = ₹1,00,000
+MAX_PER_SECTOR        = 2           # Max concurrent positions per sector
+MAX_OPEN_TRADES       = 4           # Max concurrent open positions across all sectors
+                                    # Rationale: 4 × MAX_RISK_PCT = DAILY_LOSS_LIMIT exactly
 DAILY_LOSS_LIMIT      = 0.04        # 4% of CAPITAL = ₹16,000 daily circuit breaker
-                                    # matches MAX_RISK_PCT×4 max open positions
-                                    # warning fires at 75% = 3% (see risk_manager SYNC-3)
+                                    # Warning fires at 75% = 3% (see risk_manager SYNC-3)
 
 
 # ── Trade mode ──────────────────────────────────────────────
