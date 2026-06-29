@@ -22,6 +22,8 @@
 #               data.get('WATCHLIST') but watchlist.json uses
 #               keys tier_a / tier_b / SECURITY_IDS.
 #               Now builds {symbol: security_id} correctly.
+#   2026-06-29: Added DAILY_LOSS_LIMIT — was missing, caused
+#               ImportError in risk_manager.py on live_bot start.
 # ============================================================
 
 import os
@@ -79,9 +81,12 @@ TELEGRAM_CHAT_ID_2= os.getenv("TELEGRAM_CHAT_ID_2", "")
 
 # ── Capital & position sizing ────────────────────────────────
 CAPITAL               = 400_000
-MAX_RISK_PCT          = 0.01
-MAX_CAPITAL_PER_TRADE = 0.25
+MAX_RISK_PCT          = 0.01        # 1% of capital max risk per trade
+MAX_CAPITAL_PER_TRADE = 0.25        # 25% of capital max per single position
 MAX_PER_SECTOR        = 2
+DAILY_LOSS_LIMIT      = 0.04        # 4% of CAPITAL = ₹16,000 daily circuit breaker
+                                    # matches MAX_RISK_PCT×4 max open positions
+                                    # warning fires at 75% = 3% (see risk_manager SYNC-3)
 
 
 # ── Trade mode ──────────────────────────────────────────────
