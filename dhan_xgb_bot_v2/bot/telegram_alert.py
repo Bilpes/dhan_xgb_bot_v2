@@ -34,6 +34,10 @@ log = logging.getLogger("telegram")
 
 RECIPIENTS = [TELEGRAM_CHAT_ID_1, TELEGRAM_CHAT_ID_2]
 
+SEP30 = "─" * 30
+SEP28 = "─" * 28
+SEP32 = "─" * 32
+
 
 # ── Core sender ──────────────────────────────────────────────
 
@@ -62,7 +66,7 @@ def _send(message: str) -> None:
             log.error("Telegram error for %s: %s", chat_id, exc)
 
 
-# ── Alert types ────────────────────────────────────────────
+# ── Alert types ──────────────────────────────────────────────
 
 def alert_entry(
     symbol:   str,
@@ -94,7 +98,7 @@ def alert_entry(
 
     msg = (
         f"🟢 <b>BUY ORDER PLACED</b>\n"
-        f"{─ * 30}\n"
+        f"{SEP30}\n"
         f"🏢 <b>Company</b>      : <b>{symbol}</b>\n"
         f"📈 <b>Buy Price</b>    : ₹{entry:,.2f}\n"
         f"🎯 <b>Target</b>       : ₹{target:,.2f}\n"
@@ -140,34 +144,33 @@ def alert_exit(
     result    = "✅ PROFIT" if net >= 0 else "❌ LOSS"
 
     reason_map = {
-        "SL_HIT":              "Stop-loss hit",
-        "TARGET_HIT":          "Target hit 🎯",
-        "SIGNAL_FLIP":         "Signal flip (model turned bearish)",
-        "INTRADAY_CUTOFF":     "3:15 PM square-off",
-        "TRAIL_STOP":          "Trailing stop triggered",
-        "AUTO_EXIT_EOD":       "Auto-exit (15:15 weak position)",
-        "MOMENTUM_FAILURE":    "Momentum failure exit",
+        "SL_HIT":                 "Stop-loss hit",
+        "TARGET_HIT":             "Target hit 🎯",
+        "SIGNAL_FLIP":            "Signal flip (model turned bearish)",
+        "INTRADAY_CUTOFF":        "3:15 PM square-off",
+        "TRAIL_STOP":             "Trailing stop triggered",
+        "AUTO_EXIT_EOD":          "Auto-exit (15:15 weak position)",
+        "MOMENTUM_FAILURE":       "Momentum failure exit",
         "ROTATION_BETTER_SIGNAL": "Rotated to better signal",
-        "EOD_AUTO_SQUARE_OFF": "EOD auto square-off",
-        "CIRCUIT_BREAKER":     "Circuit breaker triggered",
-        "KEYBOARD_INTERRUPT":  "Bot stopped manually",
-        "CLOSED_ON_DHAN":      "Closed on Dhan (external)",
-        "MANUAL":              "Manual exit",
+        "EOD_AUTO_SQUARE_OFF":    "EOD auto square-off",
+        "CIRCUIT_BREAKER":        "Circuit breaker triggered",
+        "KEYBOARD_INTERRUPT":     "Bot stopped manually",
+        "CLOSED_ON_DHAN":         "Closed on Dhan (external)",
+        "MANUAL":                 "Manual exit",
     }
     reason_str = reason_map.get(reason, reason)
-
-    hold_str = f"{hold_minutes:.0f} min" if hold_minutes else ""
+    hold_str   = f"{hold_minutes:.0f} min" if hold_minutes else ""
 
     msg = (
         f"{top_emoji} <b>POSITION CLOSED</b>\n"
-        f"{─ * 30}\n"
+        f"{SEP30}\n"
         f"🏢 <b>Company</b>      : <b>{symbol}</b>\n"
         f"📉 <b>Exit price</b>   : ₹{exit_price:,.2f}\n"
         f"📋 <b>Reason</b>       : {reason_str}\n"
         + (f"⏱️ <b>Held</b>          : {hold_str}\n" if hold_str else "")
         + (charges_detail if charges_detail else
            f"\n💰 <b>Net P&L</b>       : {net_sign}₹{net:,.2f}")
-        + f"\n{─ * 30}\n"
+        + f"\n{SEP30}\n"
         f"⏰ <b>Time</b>         : {time_str}\n"
         f"<b>Result: {result}  {net_sign}₹{net:,.2f}</b>"
     )
@@ -188,7 +191,7 @@ def alert_trail_update(
     """
     msg = (
         f"🔒 <b>TRAILING STOP UPDATED</b>\n"
-        f"{─ * 28}\n"
+        f"{SEP28}\n"
         f"🏢 <b>Company</b>          : <b>{symbol}</b>\n"
         f"📍 <b>Current price</b>    : ₹{ltp:,.2f}\n"
         f"🛑 <b>New stop-loss</b>    : ₹{new_sl:,.2f}\n"
@@ -198,7 +201,7 @@ def alert_trail_update(
 
 
 def alert_daily_summary(
-    pnl:          float,       # net daily pnl from risk.daily_pnl
+    pnl:          float,        # net daily pnl from risk.daily_pnl
     total_trades: int   = 0,
     wins:         int   = 0,
     losses:       int   = 0,
@@ -223,12 +226,13 @@ def alert_daily_summary(
     if trades:
         for t in trades:
             try:
-                c      = calculate_charges(t["entry"], t.get("exit", t.get("exit_price", t["entry"])), t["qty"])
-                p_sign = "+" if c.net_pnl >= 0 else ""
-                emoji  = "✅" if c.net_pnl > 0 else "❌"
+                exit_val = t.get("exit", t.get("exit_price", t["entry"]))
+                c        = calculate_charges(t["entry"], exit_val, t["qty"])
+                p_sign   = "+" if c.net_pnl >= 0 else ""
+                emoji    = "✅" if c.net_pnl > 0 else "❌"
                 trade_lines += (
                     f"\n{emoji} <b>{t['symbol']}</b>  "
-                    f"₹{t['entry']:,.1f}→₹{t.get('exit', t.get('exit_price', t['entry'])):,.1f}  "
+                    f"₹{t['entry']:,.1f}→₹{exit_val:,.1f}  "
                     f"×{t['qty']}  "
                     f"<b>net {p_sign}₹{c.net_pnl:.2f}</b>"
                 )
@@ -237,14 +241,14 @@ def alert_daily_summary(
 
     msg = (
         f"{summary_emoji} <b>DAILY SUMMARY — {time_str}</b>\n"
-        f"{─ * 32}\n"
+        f"{SEP32}\n"
         f"📊 Total trades   : {total_trades}\n"
         f"✅ Wins (net)     : {wins}\n"
         f"❌ Losses (net)   : {losses}\n"
-        f"{─ * 32}\n"
+        f"{SEP32}\n"
         f"💰 <b>Net P&L</b>       : <b>{net_sign}₹{pnl:,.2f}</b>\n"
         f"🏦 Capital now    : ₹{capital:,.0f}\n"
-        f"{─ * 32}"
+        f"{SEP32}"
         f"{trade_lines if trade_lines else chr(10) + 'No trades today.'}"
     )
     _send(msg)
@@ -256,11 +260,10 @@ def alert_daily_summary(
 
 
 def alert_circuit_breaker(
-    daily_pnl: float  = 0.0,   # live_bot passes 'daily_pnl'
-    reason:    str    = "",    # live_bot passes 'reason'
-    # legacy param names kept for backward compat
-    daily_loss: float = 0.0,
-    capital:    float = 0.0,
+    daily_pnl:  float = 0.0,   # live_bot passes 'daily_pnl'
+    reason:     str   = "",    # live_bot passes 'reason'
+    daily_loss: float = 0.0,   # legacy compat
+    capital:    float = 0.0,   # legacy compat
     **_kwargs,
 ) -> None:
     """
@@ -274,7 +277,7 @@ def alert_circuit_breaker(
     cap      = capital if capital > 0 else CAPITAL
     msg = (
         f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b>\n"
-        f"{─ * 28}\n"
+        f"{SEP28}\n"
         f"⛔ Bot has <b>stopped trading</b> for today.\n"
         f"📉 Daily net loss : -₹{loss_amt:,.2f}\n"
         f"🏦 Capital left   : ₹{cap:,.0f}\n"
@@ -316,7 +319,7 @@ def alert_test() -> None:
     c = calculate_charges(buy_price=1000, sell_price=1005, quantity=10)
     msg = (
         f"✅ <b>Telegram alert working!</b>\n"
-        f"{─ * 28}\n"
+        f"{SEP28}\n"
         f"Your Dhan XGBoost trading bot is connected.\n"
         f"Charges are calculated with EXACT Dhan MIS formula.\n\n"
         f"<b>Example: HDFCBANK  ₹1000→₹1005  ×10 shares</b>"
